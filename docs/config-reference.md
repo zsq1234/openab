@@ -70,6 +70,54 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 
 ---
 
+## `[context_mcp]`
+
+Optional Streamable HTTP MCP server for scoped chat-context reads. It is disabled
+by default and intended for deployments where the ACP agent, such as Codex via
+`codex-acp`, runs outside the OpenAB process or pod.
+
+```toml
+[context_mcp]
+enabled = true
+bind = "0.0.0.0:18080"
+route_path = "/${APP_NAME}/"
+token = "${OPENAB_CONTEXT_MCP_TOKEN}"
+default_limit = 50
+max_limit = 100
+allowed_platforms = ["discord", "slack"]
+allow_discord_normal_channels = false
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Starts the context MCP HTTP listener when true. Existing deployments are unchanged unless this is explicitly enabled. |
+| `bind` | string | `"127.0.0.1:18080"` | Socket address for the MCP listener. Use a pod-local or cluster-local address; do not expose this endpoint publicly. |
+| `route_path` | string | `"/mcp"` | HTTP path that accepts MCP JSON-RPC requests. Must start with `/` and may include a trailing slash, for example `"/${APP_NAME}/"` after env expansion. |
+| `token` | string | `""` | Bearer token required for every MCP request. Required when `enabled = true`; use an environment variable reference such as `${OPENAB_CONTEXT_MCP_TOKEN}`. |
+| `default_limit` | usize | `50` | Number of messages returned by `read_current_thread` when the MCP client omits `limit`. Must be positive and less than or equal to `max_limit`. |
+| `max_limit` | usize | `100` | Hard cap for messages returned by any context read. Must be positive. |
+| `allowed_platforms` | string[] | `[]` | Optional platform allow list. Empty means all configured platforms; non-empty values must be `"discord"` or `"slack"`. |
+| `allow_discord_normal_channels` | bool | `false` | Allows `read_current_thread` to read Discord normal channel history when the requested channel is allowed by OpenAB configuration. Keep disabled unless the agent needs channel-level context. |
+
+The MCP server exposes `read_current_thread`, which returns normalized message
+history for the current Discord thread/DM or Slack thread. Reads are bounded by
+the configured limits and still respect OpenAB's adapter channel allowlists.
+Discord normal channel history is rejected by default; pass the current
+`thread_id` from `<sender_context>` for Discord thread reads. If
+`allow_discord_normal_channels = true`, normal-channel reads are allowed only for
+channels that pass OpenAB's Discord channel allowlist. Slack reads require
+`thread_id` or `message_id`.
+
+**Security:**
+- Do not pass Discord or Slack bot tokens to the agent for history reads. Inject
+  only the MCP bearer token into the agent pod.
+- Keep the MCP Service cluster-local, rotate the bearer token through your secret
+  manager, and restart both OpenAB and the agent pod after rotation.
+- Treat the tool output as chat history. Keep `default_limit` small and set
+  `max_limit` to the largest history window you are comfortable exposing.
+
+---
+
 ## `[gateway]`
 
 Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Google Chat. Connects to the gateway via WebSocket.

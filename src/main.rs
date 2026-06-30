@@ -2,6 +2,7 @@ mod acp;
 mod adapter;
 mod bot_turns;
 mod config;
+mod context_mcp;
 mod cron;
 mod directives;
 mod discord;
@@ -235,6 +236,22 @@ async fn main() -> anyhow::Result<()> {
     // Mutex guards startup-time pushes, inner Arc<Dispatcher> shared with each adapter.
     // All pushes happen at startup; runtime access is read-only (lock is uncontended).
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let context_mcp_handle = if cfg.context_mcp.enabled {
+        let server = context_mcp::ContextMcpServer::from_config(
+            &cfg.context_mcp,
+            cfg.discord.as_ref(),
+            cfg.slack.as_ref(),
+        )?;
+        let shutdown_rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            if let Err(e) = server.run(shutdown_rx).await {
+                error!("context MCP server error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn cleanup task
     let cleanup_pool = pool.clone();
@@ -572,6 +589,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = cron_handle {
         // cron.rs drains in-flight tasks for up to 30s, so wait slightly longer
         let _ = tokio::time::timeout(std::time::Duration::from_secs(35), handle).await;
+    }
+    if let Some(handle) = context_mcp_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
     }
     // Drain per-thread dispatchers and log buffered_lost counts before pool shutdown (ADR §6.8).
     for d in dispatchers.lock().unwrap().iter() {

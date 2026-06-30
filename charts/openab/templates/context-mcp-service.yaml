@@ -1,0 +1,27 @@
+{{- range $name, $cfg := .Values.agents }}
+{{- if ne (include "openab.agentEnabled" $cfg) "false" }}
+{{- if and ($cfg.contextMcp).enabled (or (not (hasKey (($cfg.contextMcp).service | default dict) "enabled")) (($cfg.contextMcp).service.enabled)) }}
+{{- $d := dict "ctx" $ "agent" $name "cfg" $cfg }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "openab.agentFullname" $d }}-context-mcp
+  labels:
+    {{- include "openab.labels" $d | nindent 4 }}
+  {{- with (($cfg.contextMcp).service.annotations) }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ (($cfg.contextMcp).service.type | default "ClusterIP") | quote }}
+  selector:
+    {{- include "openab.selectorLabels" $d | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ (($cfg.contextMcp).service.port | default 18080) | int }}
+      targetPort: context-mcp
+      protocol: TCP
+{{- end }}
+{{- end }}
+{{- end }}

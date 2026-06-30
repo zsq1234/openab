@@ -131,6 +131,8 @@ pub struct Config {
     pub gateway: Option<GatewayConfig>,
     pub agentcore: Option<AgentCoreConfig>,
     #[serde(default)]
+    pub context_mcp: ContextMcpConfig,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub pool: PoolConfig,
@@ -149,6 +151,65 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub secrets: SecretsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextMcpConfig {
+    /// Enable the OpenAB-hosted Streamable HTTP MCP context server.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address for the MCP HTTP listener. Keep cluster-local in production.
+    #[serde(default = "default_context_mcp_bind")]
+    pub bind: String,
+    /// HTTP path that accepts MCP JSON-RPC requests.
+    #[serde(default = "default_context_mcp_route_path")]
+    pub route_path: String,
+    /// Bearer token required for all MCP requests.
+    #[serde(default)]
+    pub token: String,
+    /// Default number of messages returned when the tool omits `limit`.
+    #[serde(default = "default_context_mcp_default_limit")]
+    pub default_limit: usize,
+    /// Hard cap on messages returned by any context read.
+    #[serde(default = "default_context_mcp_max_limit")]
+    pub max_limit: usize,
+    /// Platforms enabled for context reads. Empty = all configured platforms.
+    #[serde(default)]
+    pub allowed_platforms: Vec<String>,
+    /// Allow Discord normal channel history reads. Disabled by default.
+    #[serde(default)]
+    pub allow_discord_normal_channels: bool,
+}
+
+impl Default for ContextMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_context_mcp_bind(),
+            route_path: default_context_mcp_route_path(),
+            token: String::new(),
+            default_limit: default_context_mcp_default_limit(),
+            max_limit: default_context_mcp_max_limit(),
+            allowed_platforms: Vec::new(),
+            allow_discord_normal_channels: false,
+        }
+    }
+}
+
+fn default_context_mcp_bind() -> String {
+    "127.0.0.1:18080".into()
+}
+
+fn default_context_mcp_route_path() -> String {
+    "/mcp".into()
+}
+
+fn default_context_mcp_default_limit() -> usize {
+    50
+}
+
+fn default_context_mcp_max_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1114,6 +1175,40 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
     // batch to size 1 — functionally per-message via a confusing path).
+    if config.context_mcp.enabled {
+        anyhow::ensure!(
+            !config.context_mcp.token.trim().is_empty(),
+            "context_mcp.token is required when context_mcp.enabled = true"
+        );
+        anyhow::ensure!(
+            config.context_mcp.route_path.starts_with('/'),
+            "context_mcp.route_path must start with /"
+        );
+        anyhow::ensure!(
+            !config.context_mcp.route_path.contains('?')
+                && !config.context_mcp.route_path.contains('#'),
+            "context_mcp.route_path must not contain query or fragment"
+        );
+        anyhow::ensure!(
+            config.context_mcp.default_limit > 0,
+            "context_mcp.default_limit must be > 0"
+        );
+        anyhow::ensure!(
+            config.context_mcp.max_limit > 0,
+            "context_mcp.max_limit must be > 0"
+        );
+        anyhow::ensure!(
+            config.context_mcp.default_limit <= config.context_mcp.max_limit,
+            "context_mcp.default_limit must be <= context_mcp.max_limit"
+        );
+        for platform in &config.context_mcp.allowed_platforms {
+            anyhow::ensure!(
+                matches!(platform.as_str(), "discord" | "slack"),
+                "context_mcp.allowed_platforms entries must be \"discord\" or \"slack\""
+            );
+        }
+    }
+
     if let Some(ref d) = config.discord {
         anyhow::ensure!(
             d.max_buffered_messages > 0,
@@ -1314,6 +1409,118 @@ command = "echo"
         )
         .unwrap();
         assert!(cfg.s3.is_none());
+    }
+
+    #[test]
+    fn context_mcp_defaults_to_disabled() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(!cfg.context_mcp.enabled);
+        assert_eq!(cfg.context_mcp.bind, "127.0.0.1:18080");
+        assert_eq!(cfg.context_mcp.route_path, "/mcp");
+        assert!(cfg.context_mcp.token.is_empty());
+        assert_eq!(cfg.context_mcp.default_limit, 50);
+        assert_eq!(cfg.context_mcp.max_limit, 100);
+        assert!(cfg.context_mcp.allowed_platforms.is_empty());
+        assert!(!cfg.context_mcp.allow_discord_normal_channels);
+    }
+
+    #[test]
+    fn context_mcp_enabled_requires_token() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("context_mcp.token is required"));
+    }
+
+    #[test]
+    fn context_mcp_validates_limits_and_platforms() {
+        let bad_limits = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+default_limit = 101
+max_limit = 100
+"#;
+        let err = parse_config(bad_limits, "test").unwrap_err().to_string();
+        assert!(err.contains("context_mcp.default_limit must be <= context_mcp.max_limit"));
+
+        let bad_platform = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+allowed_platforms = ["discord", "teams"]
+"#;
+        let err = parse_config(bad_platform, "test").unwrap_err().to_string();
+        assert!(err.contains("context_mcp.allowed_platforms entries"));
+
+        let bad_route_path = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+route_path = "app/mcp"
+"#;
+        let err = parse_config(bad_route_path, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_mcp.route_path must start with /"));
+    }
+
+    #[test]
+    fn context_mcp_parses_enabled_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+bind = "0.0.0.0:18080"
+route_path = "/${AB_TEST_APP_NAME}/"
+token = "secret"
+default_limit = 10
+max_limit = 20
+allowed_platforms = ["discord"]
+allow_discord_normal_channels = true
+"#;
+        std::env::set_var("AB_TEST_APP_NAME", "openab-codex");
+        let cfg = parse_config(toml, "test").unwrap();
+        std::env::remove_var("AB_TEST_APP_NAME");
+        assert!(cfg.context_mcp.enabled);
+        assert_eq!(cfg.context_mcp.bind, "0.0.0.0:18080");
+        assert_eq!(cfg.context_mcp.route_path, "/openab-codex/");
+        assert_eq!(cfg.context_mcp.token, "secret");
+        assert_eq!(cfg.context_mcp.default_limit, 10);
+        assert_eq!(cfg.context_mcp.max_limit, 20);
+        assert_eq!(cfg.context_mcp.allowed_platforms, vec!["discord"]);
+        assert!(cfg.context_mcp.allow_discord_normal_channels);
     }
 
     #[test]

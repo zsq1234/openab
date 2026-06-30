@@ -81,6 +81,13 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: stt-api-key
             {{- end }}
+            {{- if ($cfg.contextMcp).enabled }}
+            - name: OPENAB_CONTEXT_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.contextMcpSecretName" $d }}
+                  key: context-mcp-token
+            {{- end }}
             {{- if and ($cfg.gateway).enabled ($cfg.gateway).token }}
             - name: GATEWAY_WS_TOKEN
               valueFrom:
@@ -102,6 +109,12 @@ spec:
                   name: {{ .secretName }}
                   key: {{ .secretKey }}
             {{- end }}
+          {{- if ($cfg.contextMcp).enabled }}
+          ports:
+            - name: context-mcp
+              containerPort: {{ (($cfg.contextMcp).service.targetPort | default 18080) | int }}
+              protocol: TCP
+          {{- end }}
           {{- with $cfg.envFrom }}
           envFrom:
             {{- toYaml . | nindent 12 }}

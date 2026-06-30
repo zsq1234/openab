@@ -363,6 +363,33 @@ agents:
       # Echo the transcribed text back to the thread before the agent reply
       # so users can verify STT accuracy. Default: false (opt-in).
       echoTranscript: false
+    # Context MCP server for separate-pod Codex/codex-acp deployments.
+    # Disabled by default. When enabled, OpenAB exposes a token-protected
+    # Streamable HTTP MCP endpoint with the read_current_thread tool.
+    contextMcp:
+      enabled: false
+      # Bind to all pod interfaces so the optional ClusterIP Service can reach it.
+      bind: "0.0.0.0:18080"
+      # HTTP path for MCP requests. Can be set to "/${APP_NAME}/" in externally
+      # managed config; Helm renders this literal value into config.toml.
+      routePath: "/mcp"
+      # Chart-managed bearer token. For production, prefer existingSecret.
+      token: ""
+      # Use a pre-existing Secret containing key: context-mcp-token.
+      existingSecret: ""
+      defaultLimit: 50
+      maxLimit: 100
+      # Empty = all configured platforms. Otherwise values must be "discord" or "slack".
+      allowedPlatforms: []
+      # Allow read_current_thread to read Discord normal channel history when the
+      # channel passes the OpenAB allowedChannels check. Default false.
+      allowDiscordNormalChannels: false
+      service:
+        enabled: true
+        type: ClusterIP
+        port: 18080
+        targetPort: 18080
+        annotations: {}
     gateway:
       enabled: false    # set to true + provide url to enable the [gateway] config block
       deploy: true      # set to false to skip Gateway Deployment/Service (config-only mode)

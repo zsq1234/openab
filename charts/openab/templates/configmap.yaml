@@ -197,6 +197,38 @@ data:
     echo_transcript = {{ ($cfg.stt).echoTranscript }}
     {{- end }}
     {{- end }}
+    {{- if ($cfg.contextMcp).enabled }}
+    {{- if and (not (($cfg.contextMcp).token)) (not (($cfg.contextMcp).existingSecret)) }}
+    {{- fail (printf "agents.%s.contextMcp.token or existingSecret is required when contextMcp.enabled=true" $name) }}
+    {{- end }}
+    {{- if lt (int (($cfg.contextMcp).defaultLimit | default 50)) 1 }}
+    {{- fail (printf "agents.%s.contextMcp.defaultLimit must be positive" $name) }}
+    {{- end }}
+    {{- if lt (int (($cfg.contextMcp).maxLimit | default 100)) 1 }}
+    {{- fail (printf "agents.%s.contextMcp.maxLimit must be positive" $name) }}
+    {{- end }}
+    {{- if gt (int (($cfg.contextMcp).defaultLimit | default 50)) (int (($cfg.contextMcp).maxLimit | default 100)) }}
+    {{- fail (printf "agents.%s.contextMcp.defaultLimit must be <= maxLimit" $name) }}
+    {{- end }}
+    {{- if not (hasPrefix "/" (($cfg.contextMcp).routePath | default "/mcp")) }}
+    {{- fail (printf "agents.%s.contextMcp.routePath must start with /" $name) }}
+    {{- end }}
+    {{- range (($cfg.contextMcp).allowedPlatforms | default list) }}
+    {{- if not (has . (list "discord" "slack")) }}
+    {{- fail (printf "agents.%s.contextMcp.allowedPlatforms must contain only discord or slack — got: %s" $name .) }}
+    {{- end }}
+    {{- end }}
+
+    [context_mcp]
+    enabled = true
+    bind = {{ (($cfg.contextMcp).bind | default "0.0.0.0:18080") | toJson }}
+    route_path = {{ (($cfg.contextMcp).routePath | default "/mcp") | toJson }}
+    token = "${OPENAB_CONTEXT_MCP_TOKEN}"
+    default_limit = {{ (($cfg.contextMcp).defaultLimit | default 50) | int }}
+    max_limit = {{ (($cfg.contextMcp).maxLimit | default 100) | int }}
+    allowed_platforms = {{ (($cfg.contextMcp).allowedPlatforms | default list) | toJson }}
+    allow_discord_normal_channels = {{ if hasKey ($cfg.contextMcp | default dict) "allowDiscordNormalChannels" }}{{ ($cfg.contextMcp).allowDiscordNormalChannels }}{{ else }}false{{ end }}
+    {{- end }}
     {{- if ($cfg.gateway).enabled }}
     {{- if not ($cfg.gateway).url }}
     {{ fail (printf "agents.%s.gateway.url is required when gateway.enabled=true" $name) }}

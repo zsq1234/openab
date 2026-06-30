@@ -56,6 +56,17 @@ app.kubernetes.io/component: {{ .agent }}
 {{- end -}}
 {{- end }}
 
+{{/* Secret name to use for context MCP bearer token.
+     If existingSecret is set, reference it; otherwise fall back to the chart-managed agent secret.
+     The secret must contain key: context-mcp-token. */}}
+{{- define "openab.contextMcpSecretName" -}}
+{{- if and .cfg.contextMcp (.cfg.contextMcp.existingSecret | default "" | trim) -}}
+{{- .cfg.contextMcp.existingSecret | trim -}}
+{{- else -}}
+{{- include "openab.agentFullname" . -}}
+{{- end -}}
+{{- end }}
+
 {{/* Resolve image: agent-level string override → global default (repository:tag, tag defaults to appVersion).
     Caveat: "contains :" treats registry ports (e.g. my-registry:5000/img) as tagged.
     Not an issue for ghcr.io / Docker Hub; revisit if custom registries with ports are needed. */}}
