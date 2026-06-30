@@ -137,6 +137,9 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
 
+    /// Send a cancel signal to the active ACP session for `session_key`.
+    async fn cancel_session(&self, session_key: &str) -> Result<()>;
+
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
@@ -171,6 +174,10 @@ impl DispatchTarget for AdapterRouter {
 
     async fn reset_session(&self, session_key: &str) {
         let _ = self.pool().reset_session(session_key).await;
+    }
+
+    async fn cancel_session(&self, session_key: &str) -> Result<()> {
+        self.pool().cancel_session(session_key).await
     }
 
     async fn stream_prompt_blocks(
@@ -297,6 +304,11 @@ impl Dispatcher {
             BatchGrouping::Thread => format!("{platform}:{thread_id}"),
             BatchGrouping::Lane => format!("{platform}:{thread_id}:{sender_id}"),
         }
+    }
+
+    /// Access the dispatch target for platform-level controls such as `/cancel`.
+    pub fn target(&self) -> &Arc<dyn DispatchTarget> {
+        &self.target
     }
 
     /// Build the shared session pool key for a routed channel.
@@ -1421,6 +1433,10 @@ mod tests {
         }
 
         async fn reset_session(&self, _session_key: &str) {}
+
+        async fn cancel_session(&self, _session_key: &str) -> Result<()> {
+            Ok(())
+        }
 
         async fn stream_prompt_blocks(
             &self,

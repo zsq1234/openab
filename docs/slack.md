@@ -110,9 +110,11 @@ In a channel where the bot is invited:
 
 The bot will reply in a thread. After that, just type in the thread — no @mention needed for follow-ups.
 
-## Slash commands are not supported on Slack
+## Native slash commands are not supported on Slack
 
-openab supports `/models`, `/agents`, and `/cancel` on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
+openab supports `/models`, `/agents`, and full slash command registration on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
+
+Slack does support one text command inside openab threads: send `/cancel` as a normal message in the thread to cancel the current in-flight turn.
 
 The root cause is a combination of three Slack-specific platform constraints, none of which is fixable from openab's side:
 
@@ -128,7 +130,7 @@ On Discord, none of these apply: slash commands work in thread-channels, the cha
 
 - **Change the agent**: edit `[agent]` in `config.toml` (or the Helm chart values) and restart the pod / process
 - **Change the Claude model** (for `claude-code`): set `ANTHROPIC_DEFAULT_MODEL` (or equivalent env var depending on your claude-code-acp version) and restart — model selection happens at process start, not at runtime
-- **Cancel an in-flight turn**: there is no built-in way on Slack currently.
+- **Cancel an in-flight turn**: send `/cancel` as a normal message in the openab Slack thread.
 
 ## Finding Channel and User IDs
 

@@ -1195,6 +1195,29 @@ async fn handle_message(
         return;
     }
 
+    if prompt.trim() == "/cancel" && !has_files {
+        let command_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: channel_id.clone(),
+            thread_id: Some(thread_ts.clone().unwrap_or_else(|| ts.clone())),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        let thread_id = command_channel
+            .thread_id
+            .as_deref()
+            .unwrap_or(&command_channel.channel_id);
+        let session_key = format!("slack:{thread_id}");
+        let msg = match dispatcher.target().cancel_session(&session_key).await {
+            Ok(()) => "🛑 Cancel signal sent.".to_string(),
+            Err(e) => format!("⚠️ {e}"),
+        };
+        if let Err(e) = adapter.send_message(&command_channel, &msg).await {
+            warn!(error = %e, "failed to respond to Slack /cancel command");
+        }
+        return;
+    }
+
     // Caps mirror Discord's text-file attachment flow (PR #291) so both
     // adapters apply the same limits: 5 files or 1 MB of text per message.
     const TEXT_TOTAL_CAP: u64 = 1024 * 1024;

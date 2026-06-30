@@ -666,12 +666,27 @@ impl AdapterRouter {
                         text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
                     }
 
-                    // Native streaming: defer stream_begin until first Text event
-                    // so the thinking phase only shows set_status (no placeholder msg).
-                    let mut native_msg: Option<MessageRef> = None;
+                    // Native streaming: open the stream up front so Slack creates
+                    // an in-thread reply while tools are still running. Otherwise
+                    // assistant status can change for a long time with no visible
+                    // child reply until the first Text event arrives.
+                    let mut native_msg: Option<MessageRef> = if native {
+                        match adapter.stream_begin(&thread_channel, recipient.clone()).await {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    "stream_begin failed before first text; will use final send fallback"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // Once stream_begin fails, stop retrying for this turn to avoid
                     // hammering the API on transient failures.
-                    let mut stream_begin_failed = false;
+                    let mut stream_begin_failed = native && native_msg.is_none();
                     // Native delta coalescing state (used only when `native`).
                     let mut native_pending = String::new();
                     let mut native_last_flush = tokio::time::Instant::now();
@@ -791,7 +806,9 @@ impl AdapterRouter {
                                     text_buf.push_str(&t);
                                     touch_progress(&progress, None).await;
                                     if native {
-                                        // Lazy stream_begin: open the stream on first text.
+                                        // Fallback for adapters that choose not to
+                                        // open the stream up front, or if this code
+                                        // is reused with a different native adapter.
                                         if native_msg.is_none() && !stream_begin_failed {
                                             match adapter.stream_begin(&thread_channel, recipient.clone()).await {
                                                 Ok(m) => { native_msg = Some(m); }
@@ -984,13 +1001,26 @@ impl AdapterRouter {
                             // streaming mode — the streamed message is the in-thread reply.
                             match chunks.first() {
                                 Some(first) => {
-                                    let _ = adapter.stream_finish(msg, first).await;
+                                    if let Err(e) = adapter.stream_finish(msg, first).await {
+                                        tracing::warn!(error = ?e, "native stream_finish failed");
+                                    }
                                     for chunk in chunks.iter().skip(1) {
-                                        let _ = adapter.send_message(&thread_channel, chunk).await;
+                                        if let Err(e) =
+                                            adapter.send_message(&thread_channel, chunk).await
+                                        {
+                                            tracing::warn!(
+                                                error = ?e,
+                                                "native overflow chunk send failed"
+                                            );
+                                        }
                                     }
                                 }
                                 None => {
-                                    let _ = adapter.stream_finish(msg, &final_content).await;
+                                    if let Err(e) =
+                                        adapter.stream_finish(msg, &final_content).await
+                                    {
+                                        tracing::warn!(error = ?e, "native stream_finish failed");
+                                    }
                                 }
                             }
                         } else {
@@ -1003,7 +1033,12 @@ impl AdapterRouter {
                             // accumulated text_buf) as plain in-thread messages so
                             // the turn is never silently dropped.
                             for chunk in &chunks {
-                                let _ = adapter.send_message(&thread_channel, chunk).await;
+                                if let Err(e) = adapter.send_message(&thread_channel, chunk).await {
+                                    tracing::warn!(
+                                        error = ?e,
+                                        "native final send fallback failed"
+                                    );
+                                }
                             }
                         }
                     } else if let Some(msg) = placeholder_msg {
