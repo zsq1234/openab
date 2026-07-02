@@ -4,7 +4,7 @@ use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TypingHandle,
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, DiscordNormalChannelReplyMode, SttConfig};
 use crate::format;
 use crate::media;
 use crate::remind::{self, ReminderStore};
@@ -284,6 +284,7 @@ pub struct Handler {
     pub allow_bot_messages: AllowBots,
     pub trusted_bot_ids: HashSet<u64>,
     pub allow_user_messages: AllowUsers,
+    pub normal_channel_reply_mode: DiscordNormalChannelReplyMode,
     /// Role IDs that trigger the bot (same as direct @mention).
     pub allowed_role_ids: HashSet<u64>,
     /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
@@ -301,6 +302,8 @@ pub struct Handler {
     pub allow_dm: bool,
     /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
+    /// Optional MCP handoff broker for inline normal-channel turns.
+    pub handoff_broker: Option<Arc<crate::handoff::HandoffBroker>>,
     /// Reminder store for /remind slash command.
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
@@ -761,7 +764,7 @@ impl EventHandler for Handler {
             .and_then(|m| m.nick.as_ref())
             .or(msg.author.global_name.as_ref())
             .unwrap_or(&msg.author.name);
-        let sender = build_sender_context(
+        let mut sender = build_sender_context(
             &msg.author.id.to_string(),
             &msg.author.name,
             display_name,
@@ -772,6 +775,7 @@ impl EventHandler for Handler {
             &msg.id.to_string(),
             &bot_id.to_string(),
         );
+        apply_discord_reply_context(&mut sender, &msg);
 
         // Build extra content blocks from attachments (audio -> STT, text -> inline,
         // image -> encode, video -> URL for agent-side inspection).
@@ -905,8 +909,14 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
-            // DMs use the DM channel directly (no threads in DMs).
+        let inline_normal_channel = should_use_inline_normal_channel_reply(
+            in_thread,
+            is_dm,
+            self.normal_channel_reply_mode,
+        );
+        let thread_channel = if in_thread || is_dm || inline_normal_channel {
+            // DMs use the DM channel directly (no threads in DMs). Inline
+            // normal-channel mode also routes directly to the current channel.
             ChannelRef {
                 platform: "discord".into(),
                 channel_id: msg.channel_id.get().to_string(),
@@ -922,6 +932,16 @@ impl EventHandler for Handler {
                     return;
                 }
             }
+        };
+        let initial_reply_to = if inline_normal_channel {
+            Some(msg.id.to_string())
+        } else {
+            None
+        };
+        let session_key_override = if inline_normal_channel {
+            Some(inline_discord_session_key(msg.channel_id.get()))
+        } else {
+            None
         };
 
         if let Some(offloader) = self.router.discarded_file_offloader() {
@@ -981,13 +1001,13 @@ impl EventHandler for Handler {
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
         // thread_id on the very first turn.
-        let mut sender = sender;
         if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
         let dispatcher = self.dispatcher.clone();
         let stt_cfg = self.stt_config.clone();
+        let handoff_broker = self.handoff_broker.clone();
 
         tokio::spawn(async move {
             // Best-effort echo before the agent reply so the user can verify STT.
@@ -1000,10 +1020,38 @@ impl EventHandler for Handler {
             )
             .await;
 
+            if inline_normal_channel {
+                if let Some(broker) = handoff_broker.as_ref() {
+                    let mut child_sender = sender.clone();
+                    child_sender.handoff_token = None;
+                    let token = broker
+                        .register(crate::handoff::HandoffRegistration {
+                            adapter: adapter.clone(),
+                            dispatcher: dispatcher.clone(),
+                            parent_channel: thread_channel.clone(),
+                            trigger_msg: trigger_msg.clone(),
+                            sender_json: serde_json::to_string(&child_sender).unwrap(),
+                            sender_name: sender.sender_name.clone(),
+                            sender_id: sender.sender_id.clone(),
+                            original_prompt: prompt.clone(),
+                            extra_blocks: extra_blocks.clone(),
+                            other_bot_present: other_bot_present_flag,
+                        })
+                        .await;
+                    sender.handoff_token = Some(token);
+                }
+            }
+
             let sender_id = sender.sender_id.clone();
             let sender_name = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let thread_key_platform = if session_key_override.is_some() {
+                "discord-inline"
+            } else {
+                "discord"
+            };
+            let thread_key =
+                dispatcher.key(thread_key_platform, &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
@@ -1015,6 +1063,8 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
+                initial_reply_to,
+                session_key_override,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -2012,6 +2062,8 @@ impl Handler {
             }],
             other_bot_present,
             Vec::new(),
+            None,
+            None,
         );
 
         let channel_hint = if is_dm {
@@ -2158,6 +2210,8 @@ impl Handler {
         extra_blocks: Vec<ContentBlock>,
         other_bot_present_flag: bool,
         echo_entries: Vec<crate::stt::EchoEntry>,
+        initial_reply_to: Option<String>,
+        session_key_override: Option<String>,
     ) {
         if sender.thread_id.is_none() && thread_channel.parent_id.is_some() {
             sender.thread_id = Some(thread_channel.channel_id.clone());
@@ -2187,7 +2241,13 @@ impl Handler {
             let sender_id = sender.sender_id.clone();
             let sender_name = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
+            let thread_key_platform = if session_key_override.is_some() {
+                "discord-inline"
+            } else {
+                "discord"
+            };
+            let thread_key =
+                dispatcher.key(thread_key_platform, &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
@@ -2199,6 +2259,8 @@ impl Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
                 recipient: None,
+                initial_reply_to,
+                session_key_override,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -2808,6 +2870,32 @@ fn build_sender_context(
         timestamp: Some(timestamp.to_string()),
         message_id: Some(message_id.to_string()),
         receiver_id: Some(receiver_id.to_string()),
+        handoff_token: None,
+        referenced_message_id: None,
+        referenced_channel_id: None,
+        referenced_author_id: None,
+        referenced_author_name: None,
+    }
+}
+
+fn apply_discord_reply_context(sender: &mut SenderContext, msg: &Message) {
+    let Some(reference) = msg.message_reference.as_ref() else {
+        return;
+    };
+    let Some(message_id) = reference.message_id else {
+        return;
+    };
+
+    sender.referenced_message_id = Some(message_id.to_string());
+    sender.referenced_channel_id = Some(reference.channel_id.to_string());
+
+    if let Some(referenced) = msg.referenced_message.as_ref() {
+        sender.referenced_author_id = Some(referenced.author.id.to_string());
+        sender.referenced_author_name = referenced
+            .author
+            .global_name
+            .clone()
+            .or_else(|| Some(referenced.author.name.clone()));
     }
 }
 
@@ -2890,6 +2978,18 @@ fn should_process_dm(allow_dm: bool) -> bool {
 #[cfg(test)]
 fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
+}
+
+fn should_use_inline_normal_channel_reply(
+    in_thread: bool,
+    is_dm: bool,
+    mode: DiscordNormalChannelReplyMode,
+) -> bool {
+    !in_thread && !is_dm && mode == DiscordNormalChannelReplyMode::Inline
+}
+
+fn inline_discord_session_key(channel_id: u64) -> String {
+    format!("discord-inline:{channel_id}")
 }
 
 /// Pure decision function: should this message be processed or ignored?
@@ -3864,6 +3964,61 @@ mod tests {
     #[test]
     fn normal_channel_creates_thread() {
         assert!(!should_skip_thread_creation(false, false));
+    }
+
+    #[test]
+    fn normal_channel_default_reply_mode_uses_thread_creation() {
+        assert!(!should_use_inline_normal_channel_reply(
+            false,
+            false,
+            DiscordNormalChannelReplyMode::Thread
+        ));
+        assert!(!should_skip_thread_creation(false, false));
+    }
+
+    #[test]
+    fn normal_channel_explicit_thread_reply_mode_uses_thread_creation() {
+        assert!(!should_use_inline_normal_channel_reply(
+            false,
+            false,
+            DiscordNormalChannelReplyMode::Thread
+        ));
+    }
+
+    #[test]
+    fn normal_channel_inline_reply_mode_uses_current_channel() {
+        assert!(should_use_inline_normal_channel_reply(
+            false,
+            false,
+            DiscordNormalChannelReplyMode::Inline
+        ));
+    }
+
+    #[test]
+    fn existing_thread_ignores_inline_reply_mode() {
+        assert!(!should_use_inline_normal_channel_reply(
+            true,
+            false,
+            DiscordNormalChannelReplyMode::Inline
+        ));
+        assert!(should_skip_thread_creation(true, false));
+    }
+
+    #[test]
+    fn dm_ignores_inline_reply_mode() {
+        assert!(!should_use_inline_normal_channel_reply(
+            false,
+            true,
+            DiscordNormalChannelReplyMode::Inline
+        ));
+        assert!(should_skip_thread_creation(false, true));
+    }
+
+    #[test]
+    fn inline_session_key_is_deterministic_and_distinct_from_thread_key() {
+        let inline = inline_discord_session_key(123);
+        assert_eq!(inline, "discord-inline:123");
+        assert_ne!(inline, "discord:123");
     }
 
     // --- WarnAndStop dedup tests (#530) ---

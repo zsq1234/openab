@@ -1,7 +1,7 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, SlackNormalChannelReplyMode, SttConfig};
 use crate::media;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -694,10 +694,12 @@ pub async fn run_slack_adapter(
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
+    normal_channel_reply_mode: SlackNormalChannelReplyMode,
     max_bot_turns: u32,
     stt_config: SttConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
+    handoff_broker: Option<Arc<crate::handoff::HandoffBroker>>,
     discarded_file_offloader: Option<Arc<crate::s3_offload::DiscardedFileOffloader>>,
 ) -> Result<()> {
     let bot_token = adapter.bot_token().to_string();
@@ -794,6 +796,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let handoff_broker = handoff_broker.clone();
                                                 let discarded_file_offloader =
                                                     discarded_file_offloader.clone();
                                                 let team_id = envelope["payload"]["team_id"]
@@ -812,7 +815,9 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        handoff_broker,
                                                         discarded_file_offloader,
+                                                        normal_channel_reply_mode,
                                                     )
                                                     .await;
                                                 });
@@ -1035,6 +1040,7 @@ pub async fn run_slack_adapter(
                                                 let allowed_users = allowed_users.clone();
                                                 let stt_config = stt_config.clone();
                                                 let dispatcher = dispatcher.clone();
+                                                let handoff_broker = handoff_broker.clone();
                                                 let discarded_file_offloader =
                                                     discarded_file_offloader.clone();
                                                 tokio::spawn(async move {
@@ -1049,7 +1055,9 @@ pub async fn run_slack_adapter(
                                                         &allowed_users,
                                                         &stt_config,
                                                         &dispatcher,
+                                                        handoff_broker,
                                                         discarded_file_offloader,
+                                                        normal_channel_reply_mode,
                                                     )
                                                     .await;
                                                 });
@@ -1122,7 +1130,9 @@ async fn handle_message(
     allowed_users: &HashSet<String>,
     stt_config: &SttConfig,
     dispatcher: &Arc<crate::dispatch::Dispatcher>,
+    handoff_broker: Option<Arc<crate::handoff::HandoffBroker>>,
     discarded_file_offloader: Option<Arc<crate::s3_offload::DiscardedFileOffloader>>,
+    normal_channel_reply_mode: SlackNormalChannelReplyMode,
 ) {
     let channel_id = match event["channel"].as_str() {
         Some(ch) => ch.to_string(),
@@ -1173,7 +1183,10 @@ async fn handle_message(
     // stream_begin — no shared thread cache, no cross-turn race. Real users only:
     // bot IDs (B...) are rejected by chat.startStream's recipient_user_id, and an
     // empty team_id would silently degrade, so we surface that.
-    let stream_recipient = if is_bot_msg {
+    let inline_normal_channel =
+        should_use_inline_normal_channel_reply(thread_ts.as_deref(), normal_channel_reply_mode);
+
+    let stream_recipient = if is_bot_msg || inline_normal_channel {
         None
     } else {
         if team_id.is_empty() {
@@ -1434,7 +1447,7 @@ async fn handle_message(
         .await
         .unwrap_or_else(|| user_id.clone());
 
-    let sender = SenderContext {
+    let mut sender = SenderContext {
         schema: "openab.sender.v1".into(),
         sender_id: user_id.clone(),
         sender_name: display_name.clone(),
@@ -1446,6 +1459,11 @@ async fn handle_message(
         timestamp: Some(crate::timestamp::slack_ts_to_iso8601(&ts)),
         message_id: Some(ts.clone()),
         receiver_id: bot_id.map(|id| id.to_string()),
+        handoff_token: None,
+        referenced_message_id: None,
+        referenced_channel_id: None,
+        referenced_author_id: None,
+        referenced_author_name: None,
     };
 
     let trigger_msg = MessageRef {
@@ -1459,11 +1477,16 @@ async fn handle_message(
         message_id: ts.clone(),
     };
 
-    // Determine thread: if already in a thread, continue it; otherwise start a new thread
+    // Determine route: continue existing threads; otherwise either create a Slack
+    // thread reply or answer as a top-level channel message in inline mode.
     let thread_channel = ChannelRef {
         platform: "slack".into(),
         channel_id: channel_id.clone(),
-        thread_id: Some(thread_ts.unwrap_or(ts)),
+        thread_id: if inline_normal_channel {
+            None
+        } else {
+            Some(thread_ts.unwrap_or(ts))
+        },
         parent_id: None,
         origin_event_id: None,
     };
@@ -1497,18 +1520,6 @@ async fn handle_message(
         }
     }
 
-    // Serialize sender context with Slack-native key names so agents calling
-    // the Slack API directly see "thread_ts" rather than the generic "thread_id".
-    let sender_json = {
-        let mut v = serde_json::to_value(&sender).unwrap();
-        if let Some(obj) = v.as_object_mut() {
-            if let Some(tid) = obj.remove("thread_id") {
-                obj.insert("thread_ts".to_string(), tid);
-            }
-        }
-        v.to_string()
-    };
-
     let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
     let other_bot_present = {
         let cache = adapter.multibot_threads.lock().await;
@@ -1518,6 +1529,31 @@ async fn handle_message(
                 .is_some_and(|inst| inst.elapsed() < adapter.session_ttl)
         })
     };
+    if inline_normal_channel {
+        if let Some(broker) = handoff_broker.as_ref() {
+            let mut child_sender = sender.clone();
+            child_sender.handoff_token = None;
+            let token = broker
+                .register(crate::handoff::HandoffRegistration {
+                    adapter: adapter_dyn.clone(),
+                    dispatcher: dispatcher.clone(),
+                    parent_channel: thread_channel.clone(),
+                    trigger_msg: trigger_msg.clone(),
+                    sender_json: serialize_slack_sender_context(&child_sender),
+                    sender_name: sender.sender_name.clone(),
+                    sender_id: sender.sender_id.clone(),
+                    original_prompt: prompt.clone(),
+                    extra_blocks: extra_blocks.clone(),
+                    other_bot_present,
+                })
+                .await;
+            sender.handoff_token = Some(token);
+        }
+    }
+
+    // Serialize sender context with Slack-native key names so agents calling
+    // the Slack API directly see "thread_ts" rather than the generic "thread_id".
+    let sender_json = serialize_slack_sender_context(&sender);
 
     // Best-effort echo before the agent reply so the user can verify STT.
     crate::stt::post_echo(
@@ -1545,6 +1581,8 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
         recipient: stream_recipient,
+        initial_reply_to: None,
+        session_key_override: None,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
@@ -1589,6 +1627,23 @@ fn resolve_slack_mentions(text: &str, bot_id: Option<&str>) -> String {
     }
     out.push_str(s);
     out.trim().to_string()
+}
+
+fn should_use_inline_normal_channel_reply(
+    thread_ts: Option<&str>,
+    mode: SlackNormalChannelReplyMode,
+) -> bool {
+    thread_ts.is_none() && mode == SlackNormalChannelReplyMode::Inline
+}
+
+fn serialize_slack_sender_context(sender: &SenderContext) -> String {
+    let mut v = serde_json::to_value(sender).unwrap();
+    if let Some(obj) = v.as_object_mut() {
+        if let Some(tid) = obj.remove("thread_id") {
+            obj.insert("thread_ts".to_string(), tid);
+        }
+    }
+    v.to_string()
 }
 
 /// Pick the best download URL for a Slack file object. `url_private_download`
@@ -1865,6 +1920,22 @@ mod tests {
         assert_eq!(b["channel_id"], "C1");
         assert_eq!(b["thread_ts"], "1700.1");
         assert_eq!(b["status"], "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn normal_channel_reply_mode_inline_only_applies_without_thread_ts() {
+        assert!(should_use_inline_normal_channel_reply(
+            None,
+            SlackNormalChannelReplyMode::Inline
+        ));
+        assert!(!should_use_inline_normal_channel_reply(
+            Some("1700.1"),
+            SlackNormalChannelReplyMode::Inline
+        ));
+        assert!(!should_use_inline_normal_channel_reply(
+            None,
+            SlackNormalChannelReplyMode::Thread
+        ));
     }
 
     #[tokio::test]

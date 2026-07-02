@@ -83,6 +83,12 @@ data:
     {{- if hasKey ($cfg.discord | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.discord).maxBatchTokens | int }}
     {{- end }}
+    {{- if hasKey ($cfg.discord | default dict) "normalChannelReplyMode" }}
+    {{- if not (has ($cfg.discord).normalChannelReplyMode (list "thread" "inline")) }}
+    {{- fail (printf "agents.%s.discord.normalChannelReplyMode must be one of: thread, inline — got: %s" $name ($cfg.discord).normalChannelReplyMode) }}
+    {{- end }}
+    normal_channel_reply_mode = {{ ($cfg.discord).normalChannelReplyMode | toJson }}
+    {{- end }}
     {{- end }}
 
     {{- if and ($cfg.slack).enabled }}
@@ -134,6 +140,12 @@ data:
     {{- end }}
     {{- if hasKey ($cfg.slack | default dict) "maxBatchTokens" }}
     max_batch_tokens = {{ ($cfg.slack).maxBatchTokens | int }}
+    {{- end }}
+    {{- if hasKey ($cfg.slack | default dict) "normalChannelReplyMode" }}
+    {{- if not (has ($cfg.slack).normalChannelReplyMode (list "thread" "inline")) }}
+    {{- fail (printf "agents.%s.slack.normalChannelReplyMode must be one of: thread, inline — got: %s" $name ($cfg.slack).normalChannelReplyMode) }}
+    {{- end }}
+    normal_channel_reply_mode = {{ ($cfg.slack).normalChannelReplyMode | toJson }}
     {{- end }}
     {{- if and (hasKey ($cfg.slack | default dict) "assistantMode") (not ($cfg.slack).assistantMode) }}
     assistant_mode = false
@@ -213,6 +225,17 @@ data:
     {{- if not (hasPrefix "/" (($cfg.contextMcp).routePath | default "/mcp")) }}
     {{- fail (printf "agents.%s.contextMcp.routePath must start with /" $name) }}
     {{- end }}
+    {{- if and (($cfg.contextMcp).handoffEnabled) (not (($cfg.contextMcp).enabled)) }}
+    {{- fail (printf "agents.%s.contextMcp.enabled must be true when handoffEnabled=true" $name) }}
+    {{- end }}
+    {{- if lt (int (($cfg.contextMcp).handoffTokenTtlSecs | default 300)) 1 }}
+    {{- fail (printf "agents.%s.contextMcp.handoffTokenTtlSecs must be positive" $name) }}
+    {{- end }}
+    {{- range (($cfg.contextMcp).agentAllowedTools | default list) }}
+    {{- if not (has . (list "read_current_thread" "read_message" "handoff_to_thread")) }}
+    {{- fail (printf "agents.%s.contextMcp.agentAllowedTools must contain only known OpenAB MCP tools — got: %s" $name .) }}
+    {{- end }}
+    {{- end }}
     {{- range (($cfg.contextMcp).allowedPlatforms | default list) }}
     {{- if not (has . (list "discord" "slack")) }}
     {{- fail (printf "agents.%s.contextMcp.allowedPlatforms must contain only discord or slack — got: %s" $name .) }}
@@ -227,7 +250,19 @@ data:
     default_limit = {{ (($cfg.contextMcp).defaultLimit | default 50) | int }}
     max_limit = {{ (($cfg.contextMcp).maxLimit | default 100) | int }}
     allowed_platforms = {{ (($cfg.contextMcp).allowedPlatforms | default list) | toJson }}
-    allow_discord_normal_channels = {{ if hasKey ($cfg.contextMcp | default dict) "allowDiscordNormalChannels" }}{{ ($cfg.contextMcp).allowDiscordNormalChannels }}{{ else }}false{{ end }}
+    allow_normal_channels = {{ if hasKey ($cfg.contextMcp | default dict) "allowNormalChannels" }}{{ ($cfg.contextMcp).allowNormalChannels }}{{ else }}false{{ end }}
+    handoff_enabled = {{ if hasKey ($cfg.contextMcp | default dict) "handoffEnabled" }}{{ ($cfg.contextMcp).handoffEnabled }}{{ else }}false{{ end }}
+    handoff_token_ttl_secs = {{ (($cfg.contextMcp).handoffTokenTtlSecs | default 300) | int }}
+    inject_into_agent = {{ if hasKey ($cfg.contextMcp | default dict) "injectIntoAgent" }}{{ ($cfg.contextMcp).injectIntoAgent }}{{ else }}false{{ end }}
+    {{- $contextMcpAgentUrl := (($cfg.contextMcp).agentUrl | default "") }}
+    {{- if and (($cfg.contextMcp).injectIntoAgent) (not $contextMcpAgentUrl) }}
+    {{- $contextMcpAgentUrl = printf "http://%s-context-mcp:%d%s" (include "openab.agentFullname" $d) (int (($cfg.contextMcp).service.port | default 18080)) (($cfg.contextMcp).routePath | default "/mcp") }}
+    {{- end }}
+    {{- if $contextMcpAgentUrl }}
+    agent_url = {{ $contextMcpAgentUrl | toJson }}
+    {{- end }}
+    agent_server_name = {{ (($cfg.contextMcp).agentServerName | default "openab_context") | toJson }}
+    agent_allowed_tools = {{ (($cfg.contextMcp).agentAllowedTools | default list) | toJson }}
     {{- end }}
     {{- if ($cfg.gateway).enabled }}
     {{- if not ($cfg.gateway).url }}

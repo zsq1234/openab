@@ -75,6 +75,7 @@ allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
 allow_user_messages = "involved"      # involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
+normal_channel_reply_mode = "thread"  # thread | inline
 ```
 
 ### `allowed_channels` / `allowed_users`
@@ -127,6 +128,31 @@ Controls whether the bot requires @mention in threads.
 - **`involved`** — Single-bot setup, or you want all bots to respond freely in shared threads.
 - **`mentions`** — Strict control. Every message must explicitly @mention the bot. Best for high-traffic channels where accidental triggers are a concern.
 - **`multibot-mentions`** — Multi-bot setup. Natural conversation in single-bot threads, explicit @mention control in multi-bot threads. Recommended for most multi-bot deployments.
+
+### `normal_channel_reply_mode`
+
+Normal guild-channel `@bot` mentions create or reuse a Discord thread by default:
+
+```toml
+[discord]
+normal_channel_reply_mode = "thread"
+```
+
+Set inline mode when you want the bot to answer directly in the current channel instead. The first visible response references the triggering user message.
+
+```toml
+[discord]
+normal_channel_reply_mode = "inline"
+```
+
+This only changes normal guild-channel mentions. Existing thread messages continue in their thread, and DMs continue in the DM channel.
+
+When `[context_mcp] handoff_enabled = true` and the OpenAB MCP server is
+injected into the agent, inline normal-channel turns include a short-lived
+`handoff_token` in `<sender_context>`. The agent can call `handoff_to_thread`
+with that token, a title, and a task prompt to create a thread under the
+original user message and run the supplied prompt in a new thread-backed
+session. The parent inline reply should only acknowledge the created thread.
 
 ### `trusted_bot_ids`
 

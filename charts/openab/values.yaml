@@ -294,6 +294,10 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      # normalChannelReplyMode: "thread" (default) | "inline"
+      # thread: create/join a thread for normal-channel @mentions.
+      # inline: reply in the current channel, referencing the triggering message.
+      normalChannelReplyMode: "thread"
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)
@@ -340,6 +344,10 @@ agents:
       # maxBufferedMessages: 10
       # maxBatchTokens: soft token cap per ACP turn for batching modes (default 24000)
       # maxBatchTokens: 24000
+      # normalChannelReplyMode: "thread" (default) | "inline"
+      # thread: reply in a Slack thread rooted at the triggering message.
+      # inline: reply as a top-level message in the current normal channel.
+      normalChannelReplyMode: "thread"
     workingDir: /home/agent
     env: {}
     # Load env vars from existing Secrets or ConfigMaps, e.g. GH_TOKEN.
@@ -381,9 +389,23 @@ agents:
       maxLimit: 100
       # Empty = all configured platforms. Otherwise values must be "discord" or "slack".
       allowedPlatforms: []
-      # Allow read_current_thread to read Discord normal channel history when the
+      # Allow read_current_thread to read Discord/Slack normal channel history when the
       # channel passes the OpenAB allowedChannels check. Default false.
-      allowDiscordNormalChannels: false
+      allowNormalChannels: false
+      # Let inline normal-channel agents call MCP handoff_to_thread to create a
+      # thread-backed child session under the original user message.
+      handoffEnabled: false
+      # Short-lived single-use handoff token TTL.
+      handoffTokenTtlSecs: 300
+      # Inject this OpenAB MCP endpoint into ACP session/new and session/load.
+      injectIntoAgent: false
+      # Agent-reachable MCP URL. When injectIntoAgent=true and this is empty,
+      # the chart renders the per-agent ClusterIP service URL.
+      agentUrl: ""
+      agentServerName: "openab_context"
+      # Empty means no explicit allow-list; include handoff_to_thread when
+      # handoffEnabled=true and you want the agent to see only selected tools.
+      agentAllowedTools: []
       service:
         enabled: true
         type: ClusterIP

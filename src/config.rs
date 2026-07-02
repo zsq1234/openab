@@ -1,6 +1,6 @@
 use crate::markdown::TableMode;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -176,9 +176,29 @@ pub struct ContextMcpConfig {
     /// Platforms enabled for context reads. Empty = all configured platforms.
     #[serde(default)]
     pub allowed_platforms: Vec<String>,
-    /// Allow Discord normal channel history reads. Disabled by default.
+    /// Allow normal channel history reads. Disabled by default.
     #[serde(default)]
-    pub allow_discord_normal_channels: bool,
+    pub allow_normal_channels: bool,
+    /// Enable agent-initiated handoff from inline normal-channel sessions to
+    /// thread-backed sessions. Disabled by default.
+    #[serde(default)]
+    pub handoff_enabled: bool,
+    /// Lifetime for a handoff token in seconds.
+    #[serde(default = "default_context_mcp_handoff_token_ttl_secs")]
+    pub handoff_token_ttl_secs: u64,
+    /// Inject this OpenAB MCP endpoint into ACP session/new and session/load.
+    #[serde(default)]
+    pub inject_into_agent: bool,
+    /// URL agents should use to reach this OpenAB MCP endpoint. Required when
+    /// inject_into_agent is true because bind is often not agent-reachable.
+    #[serde(default)]
+    pub agent_url: Option<String>,
+    /// Name used for the injected OpenAB MCP server.
+    #[serde(default = "default_context_mcp_agent_server_name")]
+    pub agent_server_name: String,
+    /// Optional tool allow-list advertised to MCP-capable agents.
+    #[serde(default = "default_context_mcp_agent_allowed_tools")]
+    pub agent_allowed_tools: Vec<String>,
 }
 
 impl Default for ContextMcpConfig {
@@ -191,7 +211,13 @@ impl Default for ContextMcpConfig {
             default_limit: default_context_mcp_default_limit(),
             max_limit: default_context_mcp_max_limit(),
             allowed_platforms: Vec::new(),
-            allow_discord_normal_channels: false,
+            allow_normal_channels: false,
+            handoff_enabled: false,
+            handoff_token_ttl_secs: default_context_mcp_handoff_token_ttl_secs(),
+            inject_into_agent: false,
+            agent_url: None,
+            agent_server_name: default_context_mcp_agent_server_name(),
+            agent_allowed_tools: default_context_mcp_agent_allowed_tools(),
         }
     }
 }
@@ -210,6 +236,18 @@ fn default_context_mcp_default_limit() -> usize {
 
 fn default_context_mcp_max_limit() -> usize {
     100
+}
+
+fn default_context_mcp_handoff_token_ttl_secs() -> u64 {
+    300
+}
+
+fn default_context_mcp_agent_server_name() -> String {
+    "openab_context".into()
+}
+
+fn default_context_mcp_agent_allowed_tools() -> Vec<String> {
+    vec!["read_current_thread".into(), "read_message".into()]
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -463,6 +501,9 @@ pub struct DiscordConfig {
     /// Message dispatch mode. Default: per-message (v0.8.2-beta.1 behaviour).
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
+    /// Normal guild-channel @mention reply mode. Default: create a thread.
+    #[serde(default)]
+    pub normal_channel_reply_mode: DiscordNormalChannelReplyMode,
     /// Batched mode only: per-thread channel capacity. Default: 10.
     #[serde(default = "default_max_buffered_messages")]
     pub max_buffered_messages: usize,
@@ -512,6 +553,34 @@ impl<'de> Deserialize<'de> for AllowUsers {
     }
 }
 
+/// Controls how Discord normal-channel @mentions are answered.
+///
+/// - `Thread` (default): create or join a platform thread from the trigger message.
+/// - `Inline`: reply directly in the current channel, referencing the trigger message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NormalChannelReplyMode {
+    #[default]
+    Thread,
+    Inline,
+}
+
+impl<'de> Deserialize<'de> for NormalChannelReplyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "thread" => Ok(Self::Thread),
+            "inline" => Ok(Self::Inline),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["thread", "inline"],
+            )),
+        }
+    }
+}
+
+pub type DiscordNormalChannelReplyMode = NormalChannelReplyMode;
+pub type SlackNormalChannelReplyMode = NormalChannelReplyMode;
+
 #[derive(Debug, Deserialize)]
 pub struct SlackConfig {
     pub bot_token: String,
@@ -542,6 +611,9 @@ pub struct SlackConfig {
     /// Message dispatch mode. Default: per-message.
     #[serde(default)]
     pub message_processing_mode: MessageProcessingMode,
+    /// Normal channel @mention reply mode. Default: use Slack thread replies.
+    #[serde(default)]
+    pub normal_channel_reply_mode: SlackNormalChannelReplyMode,
     /// Batched mode only: per-thread channel capacity. Default: 10.
     #[serde(default = "default_max_buffered_messages")]
     pub max_buffered_messages: usize,
@@ -609,6 +681,7 @@ struct AgentConfigRaw {
     per_session_working_dir: bool,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    mcp_servers: Vec<AgentMcpServerConfig>,
 }
 
 impl Default for AgentConfigRaw {
@@ -623,6 +696,7 @@ impl Default for AgentConfigRaw {
             per_session_working_dir: false,
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -638,6 +712,7 @@ pub struct AgentConfig {
     pub per_session_working_dir: bool,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    pub mcp_servers: Vec<AgentMcpServerConfig>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -654,6 +729,7 @@ impl Default for AgentConfig {
             per_session_working_dir: false,
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            mcp_servers: Vec::new(),
             command_explicit: false,
         }
     }
@@ -684,9 +760,64 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             per_session_working_dir: raw.per_session_working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            mcp_servers: raw.mcp_servers,
             command_explicit: cmd_explicit,
         })
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentMcpServerConfig {
+    pub name: String,
+    #[serde(default = "default_agent_mcp_server_type", rename = "type")]
+    pub transport: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+fn default_agent_mcp_server_type() -> String {
+    "http".into()
+}
+
+fn inject_context_mcp_server(config: &mut Config) {
+    let Some(url) = config.context_mcp.agent_url.clone() else {
+        return;
+    };
+    let name = config.context_mcp.agent_server_name.clone();
+    if config
+        .agent
+        .mcp_servers
+        .iter()
+        .any(|server| server.name == name)
+    {
+        return;
+    }
+
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".into(),
+        format!("Bearer {}", config.context_mcp.token),
+    );
+
+    let mut allowed_tools = config.context_mcp.agent_allowed_tools.clone();
+    if config.context_mcp.handoff_enabled
+        && !allowed_tools
+            .iter()
+            .any(|tool| tool.as_str() == "handoff_to_thread")
+    {
+        allowed_tools.push("handoff_to_thread".into());
+    }
+
+    config.agent.mcp_servers.push(AgentMcpServerConfig {
+        name,
+        transport: "http".into(),
+        url,
+        headers,
+        allowed_tools,
+    });
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1148,6 +1279,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 per_session_working_dir: config.agent.per_session_working_dir,
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                mcp_servers: config.agent.mcp_servers.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -1170,6 +1302,31 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 "agent.url is required when agent.transport = \"websocket\""
             );
         }
+    }
+
+    if config.context_mcp.handoff_enabled {
+        anyhow::ensure!(
+            config.context_mcp.enabled,
+            "context_mcp.enabled must be true when context_mcp.handoff_enabled = true"
+        );
+    }
+    if config.context_mcp.inject_into_agent {
+        anyhow::ensure!(
+            config.context_mcp.enabled,
+            "context_mcp.enabled must be true when context_mcp.inject_into_agent = true"
+        );
+        anyhow::ensure!(
+            config
+                .context_mcp
+                .agent_url
+                .as_deref()
+                .is_some_and(|url| !url.trim().is_empty()),
+            "context_mcp.agent_url is required when context_mcp.inject_into_agent = true"
+        );
+        anyhow::ensure!(
+            !config.context_mcp.agent_server_name.trim().is_empty(),
+            "context_mcp.agent_server_name must not be empty"
+        );
     }
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
@@ -1207,6 +1364,40 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 "context_mcp.allowed_platforms entries must be \"discord\" or \"slack\""
             );
         }
+        anyhow::ensure!(
+            config.context_mcp.handoff_token_ttl_secs > 0,
+            "context_mcp.handoff_token_ttl_secs must be > 0"
+        );
+        for tool in &config.context_mcp.agent_allowed_tools {
+            anyhow::ensure!(
+                matches!(
+                    tool.as_str(),
+                    "read_current_thread" | "read_message" | "handoff_to_thread"
+                ),
+                "context_mcp.agent_allowed_tools entries must be known OpenAB MCP tools"
+            );
+        }
+    }
+
+    for server in &config.agent.mcp_servers {
+        anyhow::ensure!(
+            !server.name.trim().is_empty(),
+            "agent.mcp_servers entries must have a non-empty name"
+        );
+        anyhow::ensure!(
+            !server.url.trim().is_empty(),
+            "agent.mcp_servers.{name}.url must not be empty",
+            name = server.name
+        );
+        anyhow::ensure!(
+            matches!(server.transport.as_str(), "http" | "streamable-http"),
+            "agent.mcp_servers.{name}.type must be \"http\" or \"streamable-http\"",
+            name = server.name
+        );
+    }
+
+    if config.context_mcp.inject_into_agent {
+        inject_context_mcp_server(&mut config);
     }
 
     if let Some(ref d) = config.discord {
@@ -1421,7 +1612,17 @@ command = "echo"
         assert_eq!(cfg.context_mcp.default_limit, 50);
         assert_eq!(cfg.context_mcp.max_limit, 100);
         assert!(cfg.context_mcp.allowed_platforms.is_empty());
-        assert!(!cfg.context_mcp.allow_discord_normal_channels);
+        assert!(!cfg.context_mcp.allow_normal_channels);
+        assert!(!cfg.context_mcp.handoff_enabled);
+        assert_eq!(cfg.context_mcp.handoff_token_ttl_secs, 300);
+        assert!(!cfg.context_mcp.inject_into_agent);
+        assert!(cfg.context_mcp.agent_url.is_none());
+        assert_eq!(cfg.context_mcp.agent_server_name, "openab_context");
+        assert_eq!(
+            cfg.context_mcp.agent_allowed_tools,
+            vec!["read_current_thread", "read_message"]
+        );
+        assert!(cfg.agent.mcp_servers.is_empty());
     }
 
     #[test]
@@ -1492,6 +1693,56 @@ route_path = "app/mcp"
     }
 
     #[test]
+    fn context_mcp_validates_handoff_and_agent_injection() {
+        let handoff_without_server = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+handoff_enabled = true
+"#;
+        let err = parse_config(handoff_without_server, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_mcp.enabled must be true"));
+
+        let inject_without_url = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+inject_into_agent = true
+"#;
+        let err = parse_config(inject_without_url, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_mcp.agent_url is required"));
+
+        let bad_tool = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+agent_allowed_tools = ["read_current_thread", "unknown"]
+"#;
+        let err = parse_config(bad_tool, "test").unwrap_err().to_string();
+        assert!(err.contains("context_mcp.agent_allowed_tools entries"));
+    }
+
+    #[test]
     fn context_mcp_parses_enabled_config() {
         let toml = r#"
 [discord]
@@ -1508,7 +1759,13 @@ token = "secret"
 default_limit = 10
 max_limit = 20
 allowed_platforms = ["discord"]
-allow_discord_normal_channels = true
+allow_normal_channels = true
+handoff_enabled = true
+handoff_token_ttl_secs = 120
+inject_into_agent = true
+agent_url = "http://openab-core:18080/openab-codex/"
+agent_server_name = "openab_handoff"
+agent_allowed_tools = ["read_current_thread"]
 "#;
         std::env::set_var("AB_TEST_APP_NAME", "openab-codex");
         let cfg = parse_config(toml, "test").unwrap();
@@ -1520,7 +1777,61 @@ allow_discord_normal_channels = true
         assert_eq!(cfg.context_mcp.default_limit, 10);
         assert_eq!(cfg.context_mcp.max_limit, 20);
         assert_eq!(cfg.context_mcp.allowed_platforms, vec!["discord"]);
-        assert!(cfg.context_mcp.allow_discord_normal_channels);
+        assert!(cfg.context_mcp.allow_normal_channels);
+        assert!(cfg.context_mcp.handoff_enabled);
+        assert_eq!(cfg.context_mcp.handoff_token_ttl_secs, 120);
+        assert!(cfg.context_mcp.inject_into_agent);
+        assert_eq!(
+            cfg.context_mcp.agent_url.as_deref(),
+            Some("http://openab-core:18080/openab-codex/")
+        );
+        assert_eq!(cfg.context_mcp.agent_server_name, "openab_handoff");
+        assert_eq!(
+            cfg.context_mcp.agent_allowed_tools,
+            vec!["read_current_thread"]
+        );
+        assert_eq!(cfg.agent.mcp_servers.len(), 1);
+        let server = &cfg.agent.mcp_servers[0];
+        assert_eq!(server.name, "openab_handoff");
+        assert_eq!(server.transport, "http");
+        assert_eq!(server.url, "http://openab-core:18080/openab-codex/");
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer secret")
+        );
+        assert_eq!(
+            server.allowed_tools,
+            vec!["read_current_thread", "handoff_to_thread"]
+        );
+    }
+
+    #[test]
+    fn agent_mcp_servers_parse_explicit_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[[agent.mcp_servers]]
+name = "linear"
+type = "http"
+url = "https://mcp.linear.app/mcp"
+headers = { Authorization = "Bearer token" }
+allowed_tools = ["create_issue"]
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.agent.mcp_servers.len(), 1);
+        let server = &cfg.agent.mcp_servers[0];
+        assert_eq!(server.name, "linear");
+        assert_eq!(server.transport, "http");
+        assert_eq!(server.url, "https://mcp.linear.app/mcp");
+        assert_eq!(
+            server.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token")
+        );
+        assert_eq!(server.allowed_tools, vec!["create_issue"]);
     }
 
     #[test]
@@ -1739,6 +2050,45 @@ command = "echo"
     }
 
     #[test]
+    fn normal_channel_reply_mode_default_is_thread() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().normal_channel_reply_mode,
+            DiscordNormalChannelReplyMode::Thread
+        );
+    }
+
+    #[test]
+    fn normal_channel_reply_mode_parses_inline() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+normal_channel_reply_mode = "inline"
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.discord.unwrap().normal_channel_reply_mode,
+            DiscordNormalChannelReplyMode::Inline
+        );
+    }
+
+    #[test]
+    fn normal_channel_reply_mode_unknown_value_errors() {
+        let toml = r#"
+[discord]
+bot_token = "t"
+normal_channel_reply_mode = "channel"
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(toml, "test").is_err());
+    }
+
+    #[test]
     fn message_processing_mode_unknown_value_errors() {
         let toml = r#"
 [discord]
@@ -1851,11 +2201,21 @@ command = "echo"
     fn slack_assistant_mode_defaults_true_and_parses_false() {
         let cfg: SlackConfig = toml::from_str("bot_token = \"x\"\napp_token = \"y\"\n").unwrap();
         assert!(cfg.assistant_mode, "assistant_mode must default to true");
+        assert_eq!(
+            cfg.normal_channel_reply_mode,
+            SlackNormalChannelReplyMode::Thread
+        );
 
         let cfg2: SlackConfig =
-            toml::from_str("bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\n")
-                .unwrap();
+            toml::from_str(
+                "bot_token = \"x\"\napp_token = \"y\"\nassistant_mode = false\nnormal_channel_reply_mode = \"inline\"\n",
+            )
+            .unwrap();
         assert!(!cfg2.assistant_mode);
+        assert_eq!(
+            cfg2.normal_channel_reply_mode,
+            SlackNormalChannelReplyMode::Inline
+        );
     }
 
     #[test]

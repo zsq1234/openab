@@ -55,6 +55,11 @@ pub struct BufferedMessage {
     /// mode's native streaming is active. `None` for non-Slack platforms and
     /// bot-authored turns.
     pub recipient: Option<(String, String)>,
+    /// Optional first-reply platform message reference.
+    pub initial_reply_to: Option<String>,
+    /// Optional session key override for modes whose response route differs
+    /// from their logical conversation identity.
+    pub session_key_override: Option<String>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -151,6 +156,7 @@ pub trait DispatchTarget: Send + Sync + 'static {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        initial_reply_to: Option<String>,
     ) -> Result<()>;
 }
 
@@ -189,6 +195,7 @@ impl DispatchTarget for AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        initial_reply_to: Option<String>,
     ) -> Result<()> {
         AdapterRouter::stream_prompt_blocks(
             self,
@@ -199,6 +206,7 @@ impl DispatchTarget for AdapterRouter {
             reactions,
             other_bot_present,
             recipient,
+            initial_reply_to,
         )
         .await
     }
@@ -635,7 +643,10 @@ async fn dispatch_batch(
 ) {
     let dispatch_start = Instant::now();
     let batch_size = batch.len();
-    let session_key = Dispatcher::session_key(thread_channel);
+    let session_key = batch
+        .last()
+        .and_then(|m| m.session_key_override.clone())
+        .unwrap_or_else(|| Dispatcher::session_key(thread_channel));
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
     // Skip when assistant status API is active — uses
@@ -659,6 +670,7 @@ async fn dispatch_batch(
     // Native-streaming recipient is bound to the turn (captured per-message). A
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
     let recipient: Option<(String, String)> = batch.last().and_then(|m| m.recipient.clone());
+    let initial_reply_to: Option<String> = batch.last().and_then(|m| m.initial_reply_to.clone());
 
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
@@ -788,6 +800,7 @@ async fn dispatch_batch(
             reactions.clone(),
             other_bot_present,
             recipient,
+            initial_reply_to,
         )
         .await;
 
@@ -1211,6 +1224,7 @@ mod tests {
             per_session_working_dir: false,
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
+            mcp_servers: vec![],
             command_explicit: true,
         };
         let pool = Arc::new(SessionPool::new(agent_cfg, 1));
@@ -1377,9 +1391,11 @@ mod tests {
     /// One recorded `stream_prompt_blocks` invocation.
     #[derive(Clone)]
     struct RecordedDispatch {
+        session_key: String,
         block_count: usize,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
+        initial_reply_to: Option<String>,
     }
 
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
@@ -1441,17 +1457,20 @@ mod tests {
         async fn stream_prompt_blocks(
             &self,
             _adapter: &Arc<dyn ChatAdapter>,
-            _session_key: &str,
+            session_key: &str,
             content_blocks: Vec<ContentBlock>,
             thread_channel: &ChannelRef,
             _reactions: Arc<StatusReactionController>,
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
+            initial_reply_to: Option<String>,
         ) -> Result<()> {
             self.calls.lock().unwrap().push(RecordedDispatch {
+                session_key: session_key.to_string(),
                 block_count: content_blocks.len(),
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
+                initial_reply_to,
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1526,6 +1545,8 @@ mod tests {
             estimated_tokens: tokens,
             other_bot_present: false,
             recipient: None,
+            initial_reply_to: None,
+            session_key_override: None,
         }
     }
 
@@ -1609,6 +1630,28 @@ mod tests {
             calls[0].dispatch_channel.origin_event_id.as_deref(),
             Some("evt-second")
         );
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatch_uses_last_event_initial_reply_target_for_merged_batch() {
+        let mut first = make_msg("a", 80);
+        first.initial_reply_to = Some("msg-first".into());
+        let mut second = make_msg("b", 80);
+        second.initial_reply_to = Some("msg-second".into());
+
+        let calls = run_consumer_with_messages(vec![first, second], 10, 200).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].initial_reply_to.as_deref(), Some("msg-second"));
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatch_uses_session_key_override_for_inline_channel_mode() {
+        let mut msg = make_msg("hi", 10);
+        msg.session_key_override = Some("discord-inline:123".into());
+
+        let calls = run_consumer_with_messages(vec![msg], 10, 24_000).await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].session_key, "discord-inline:123");
     }
 
     #[tokio::test]

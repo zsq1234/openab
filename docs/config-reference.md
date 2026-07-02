@@ -42,6 +42,7 @@ Discord adapter. Requires a Discord bot token.
 | `allow_dm` | bool | `false` | `true` = respond to Discord DMs; `false` = ignore DMs. `allowed_users` still applies in DMs. Each DM user consumes one session slot. |
 | `max_bot_turns` | u32 | `100` | Max consecutive bot turns per thread before throttling (soft limit). Human message resets the counter. A compiled-in hard cap of 1000 consecutive bot messages is always enforced. |
 | `message_processing_mode` | string | `"per-message"` | Message dispatch mode: `"per-message"` (each message = own turn), `"per-thread"` (all messages in thread share one buffer), or `"per-lane"` (each sender gets own buffer). See [Message Dispatch Modes](message-dispatch-modes.md). |
+| `normal_channel_reply_mode` | string | `"thread"` | Normal guild-channel `@bot` behavior: `"thread"` creates or joins a Discord thread from the triggering message; `"inline"` replies in the current channel and references the triggering message. Threads and DMs are unchanged. |
 | `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies to `per-thread` / `per-lane` modes. |
 | `max_batch_tokens` | u32 | `24000` | Soft token cap per ACP turn. Only applies to `per-thread` / `per-lane` modes. |
 
@@ -64,6 +65,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `allow_user_messages` | string | `"involved"` | Same as Discord. |
 | `max_bot_turns` | u32 | `100` | Same as Discord. |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
+| `normal_channel_reply_mode` | string | `"thread"` | Normal-channel `@bot` behavior: `"thread"` replies in a Slack thread rooted at the triggering message; `"inline"` replies as a top-level message in the current channel. Existing Slack threads are unchanged. |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |
 | `assistant_mode` | bool | `true` | Use `assistant.threads.setStatus` for status indicators instead of emoji reactions, and native content streaming via `chat.startStream`/`appendStream`/`stopStream` instead of the post+edit loop. Native streaming is suppressed when another bot is present in the thread. Requires an AI-app Slack app with `assistant:write` — set to `false` for non-AI Slack apps to keep emoji-reaction status. When native streaming is active, the `reply_to` output directive is bypassed — the streamed message is itself the in-thread reply. |
@@ -85,7 +87,13 @@ token = "${OPENAB_CONTEXT_MCP_TOKEN}"
 default_limit = 50
 max_limit = 100
 allowed_platforms = ["discord", "slack"]
-allow_discord_normal_channels = false
+allow_normal_channels = false
+handoff_enabled = false
+handoff_token_ttl_secs = 300
+inject_into_agent = false
+agent_url = "http://openab-context-mcp:18080/mcp"
+agent_server_name = "openab_context"
+agent_allowed_tools = ["read_current_thread", "read_message", "handoff_to_thread"]
 ```
 
 | Key | Type | Default | Description |
@@ -97,16 +105,47 @@ allow_discord_normal_channels = false
 | `default_limit` | usize | `50` | Number of messages returned by `read_current_thread` when the MCP client omits `limit`. Must be positive and less than or equal to `max_limit`. |
 | `max_limit` | usize | `100` | Hard cap for messages returned by any context read. Must be positive. |
 | `allowed_platforms` | string[] | `[]` | Optional platform allow list. Empty means all configured platforms; non-empty values must be `"discord"` or `"slack"`. |
-| `allow_discord_normal_channels` | bool | `false` | Allows `read_current_thread` to read Discord normal channel history when the requested channel is allowed by OpenAB configuration. Keep disabled unless the agent needs channel-level context. |
+| `allow_normal_channels` | bool | `false` | Allows `read_current_thread` to read Discord or Slack normal channel history when the requested channel is allowed by OpenAB configuration. Keep disabled unless the agent needs channel-level context. |
+| `handoff_enabled` | bool | `false` | Enables `handoff_to_thread`, an MCP action tool that lets an inline normal-channel agent start a thread-backed child task under the original user message. Requires `enabled = true`. |
+| `handoff_token_ttl_secs` | u64 | `300` | Lifetime for each single-use handoff token exposed in `<sender_context>`. |
+| `inject_into_agent` | bool | `false` | Adds this OpenAB MCP server to ACP `session/new` and `session/load` `mcpServers` payloads. Requires `agent_url`. |
+| `agent_url` | string | — | Agent-reachable URL for this MCP endpoint, for example a Kubernetes Service URL. Required when `inject_into_agent = true`. |
+| `agent_server_name` | string | `"openab_context"` | Name used for the injected MCP server. |
+| `agent_allowed_tools` | string[] | `["read_current_thread", "read_message"]` | Optional OpenAB MCP tool allow-list for injected MCP configuration. Known tools are `read_current_thread`, `read_message`, and `handoff_to_thread`. When handoff is enabled, OpenAB adds `handoff_to_thread` to the injected server allow-list if missing. |
 
-The MCP server exposes `read_current_thread`, which returns normalized message
-history for the current Discord thread/DM or Slack thread. Reads are bounded by
-the configured limits and still respect OpenAB's adapter channel allowlists.
-Discord normal channel history is rejected by default; pass the current
-`thread_id` from `<sender_context>` for Discord thread reads. If
-`allow_discord_normal_channels = true`, normal-channel reads are allowed only for
-channels that pass OpenAB's Discord channel allowlist. Slack reads require
-`thread_id` or `message_id`.
+The MCP server exposes:
+
+- `read_current_thread`, which returns normalized message history for the current
+  Discord thread/DM or Slack thread. When explicitly enabled, it can also read
+  bounded Discord or Slack normal-channel history. Reads are bounded by the
+  configured limits and still respect OpenAB's adapter channel allowlists.
+- `read_message`, which returns one normalized Discord or Slack message by
+  `channel_id` and `message_id`. For Discord reply/quote messages, OpenAB adds
+  `referenced_channel_id` and `referenced_message_id` to `<sender_context>`; pass
+  those values to `read_message` when the referenced message is outside the
+  recent thread history window.
+- `handoff_to_thread`, when `handoff_enabled = true`, which creates a
+  thread-backed task from the current inline normal-channel message and returns
+  after the child task is enqueued. The agent passes
+  `<sender_context>.handoff_token`, a thread title, and the child task prompt.
+
+When MCP injection is configured explicitly under `[agent]`, OpenAB passes the
+configured servers to ACP sessions as a name-keyed `mcpServers` object:
+
+```toml
+[[agent.mcp_servers]]
+name = "openab_context"
+type = "http"
+url = "http://openab-context-mcp:18080/mcp"
+headers = { Authorization = "Bearer ${OPENAB_CONTEXT_MCP_TOKEN}" }
+allowed_tools = ["read_current_thread", "read_message", "handoff_to_thread"]
+```
+
+Normal channel history is rejected by default; pass the current `thread_id` from
+`<sender_context>` for thread reads. If `allow_normal_channels = true`,
+normal-channel reads are allowed only for channels that pass the platform
+adapter's channel allowlist. Slack normal-channel reads use
+`conversations.history`.
 
 **Security:**
 - Do not pass Discord or Slack bot tokens to the agent for history reads. Inject
@@ -600,8 +639,10 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.discord.trustedBotIds` | `[discord] trusted_bot_ids` |
 | `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
 | `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
+| `agents.<name>.discord.normalChannelReplyMode` | `[discord] normal_channel_reply_mode` |
 | `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
 | `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
+| `agents.<name>.slack.normalChannelReplyMode` | `[slack] normal_channel_reply_mode` |
 | `agents.<name>.slack.*` | `[slack] *` (same pattern) |
 | `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
 | `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
@@ -609,6 +650,9 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.reactions.enabled` | `[reactions] enabled` |
 | `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
 | `agents.<name>.stt.apiKey` | `[stt] api_key` |
+| `agents.<name>.contextMcp.handoffEnabled` | `[context_mcp] handoff_enabled` |
+| `agents.<name>.contextMcp.injectIntoAgent` | `[context_mcp] inject_into_agent` |
+| `agents.<name>.contextMcp.agentUrl` | `[context_mcp] agent_url` |
 | `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
 | `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |
 | `agents.<name>.cronjobs[].channel` | `[[cron.jobs]] channel` |

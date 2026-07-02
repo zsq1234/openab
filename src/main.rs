@@ -10,6 +10,7 @@ mod dispatch;
 mod error_display;
 mod format;
 mod gateway;
+mod handoff;
 mod hooks;
 mod markdown;
 mod media;
@@ -237,11 +238,20 @@ async fn main() -> anyhow::Result<()> {
     // All pushes happen at startup; runtime access is read-only (lock is uncontended).
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let handoff_broker = if cfg.context_mcp.handoff_enabled {
+        Some(Arc::new(handoff::HandoffBroker::new(
+            std::time::Duration::from_secs(cfg.context_mcp.handoff_token_ttl_secs),
+        )))
+    } else {
+        None
+    };
+
     let context_mcp_handle = if cfg.context_mcp.enabled {
         let server = context_mcp::ContextMcpServer::from_config(
             &cfg.context_mcp,
             cfg.discord.as_ref(),
             cfg.slack.as_ref(),
+            handoff_broker.clone(),
         )?;
         let shutdown_rx = shutdown_rx.clone();
         Some(tokio::spawn(async move {
@@ -309,6 +319,7 @@ async fn main() -> anyhow::Result<()> {
             users = slack_cfg.allowed_users.len(),
             allow_bot_messages = ?slack_cfg.allow_bot_messages,
             allow_user_messages = ?slack_cfg.allow_user_messages,
+            normal_channel_reply_mode = ?slack_cfg.normal_channel_reply_mode,
             "starting slack adapter"
         );
         let router = router.clone();
@@ -318,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
         let adapter = shared_slack_adapter
             .clone()
             .expect("shared_slack_adapter must exist when slack config is present");
+        let slack_handoff_broker = handoff_broker.clone();
         // Dispatcher is the sole serialization path for all modes. Message = cap 1
         // (each message dispatches alone, FIFO). Thread / Lane = configured cap;
         // grouping decides whether senders share a buffer or get their own lane.
@@ -344,10 +356,12 @@ async fn main() -> anyhow::Result<()> {
                 slack_cfg.allow_bot_messages,
                 slack_cfg.trusted_bot_ids.into_iter().collect(),
                 slack_cfg.allow_user_messages,
+                slack_cfg.normal_channel_reply_mode,
                 max_bot_turns,
                 stt,
                 slack_shutdown_rx,
                 slack_dispatcher,
+                slack_handoff_broker,
                 router.discarded_file_offloader(),
             )
             .await
@@ -482,6 +496,7 @@ async fn main() -> anyhow::Result<()> {
             role_triggers = allowed_role_ids.len(),
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
+            normal_channel_reply_mode = ?discord_cfg.normal_channel_reply_mode,
             allow_dm = discord_cfg.allow_dm,
             "starting discord adapter"
         );
@@ -518,6 +533,7 @@ async fn main() -> anyhow::Result<()> {
             allow_bot_messages: discord_cfg.allow_bot_messages,
             trusted_bot_ids,
             allow_user_messages: discord_cfg.allow_user_messages,
+            normal_channel_reply_mode: discord_cfg.normal_channel_reply_mode,
             allowed_role_ids,
             participated_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             multibot_threads: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -528,6 +544,7 @@ async fn main() -> anyhow::Result<()> {
             )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
+            handoff_broker: handoff_broker.clone(),
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         };

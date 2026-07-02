@@ -8,7 +8,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -20,6 +20,10 @@ use tracing::{info, warn};
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const TOOL_READ_CURRENT_THREAD: &str = "read_current_thread";
+const TOOL_READ_MESSAGE: &str = "read_message";
+const TOOL_HANDOFF_TO_THREAD: &str = "handoff_to_thread";
+const MAX_HANDOFF_TITLE_CHARS: usize = 100;
+const MAX_HANDOFF_PROMPT_CHARS: usize = 24_000;
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 const SLACK_API_BASE: &str = "https://slack.com/api";
 
@@ -40,11 +44,14 @@ struct ContextMcpState {
     allowed_platforms: HashSet<String>,
     discord: Option<DiscordContext>,
     slack: Option<SlackContext>,
+    handoff: Option<Arc<crate::handoff::HandoffBroker>>,
     discord_api_base: String,
     slack_api_base: String,
     http: reqwest::Client,
     #[cfg(test)]
     mock_read_result: Option<ThreadReadResult>,
+    #[cfg(test)]
+    mock_message_result: Option<MessageReadResult>,
 }
 
 #[derive(Clone)]
@@ -60,6 +67,7 @@ struct SlackContext {
     token: String,
     allow_all_channels: bool,
     allowed_channels: HashSet<String>,
+    allow_normal_channels: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -90,6 +98,14 @@ struct ThreadReadResult {
     limit: usize,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct MessageReadResult {
+    platform: String,
+    channel_id: String,
+    thread_id: Option<String>,
+    message: NormalizedMessage,
+}
+
 #[derive(Debug)]
 struct ReadRequest {
     platform: String,
@@ -104,6 +120,7 @@ impl ContextMcpServer {
         config: &ContextMcpConfig,
         discord: Option<&DiscordConfig>,
         slack: Option<&SlackConfig>,
+        handoff: Option<Arc<crate::handoff::HandoffBroker>>,
     ) -> Result<Self> {
         let bind = config
             .bind
@@ -119,12 +136,13 @@ impl ContextMcpServer {
             token: d.bot_token.clone(),
             allow_all_channels: resolve_allow_all(d.allow_all_channels, &d.allowed_channels),
             allowed_channels: d.allowed_channels.iter().cloned().collect(),
-            allow_normal_channels: config.allow_discord_normal_channels,
+            allow_normal_channels: config.allow_normal_channels,
         });
         let slack = slack.map(|s| SlackContext {
             token: s.bot_token.clone(),
             allow_all_channels: resolve_allow_all(s.allow_all_channels, &s.allowed_channels),
             allowed_channels: s.allowed_channels.iter().cloned().collect(),
+            allow_normal_channels: config.allow_normal_channels,
         });
 
         Ok(Self {
@@ -137,11 +155,14 @@ impl ContextMcpServer {
                 allowed_platforms,
                 discord,
                 slack,
+                handoff,
                 discord_api_base: DISCORD_API_BASE.into(),
                 slack_api_base: SLACK_API_BASE.into(),
                 http: reqwest::Client::new(),
                 #[cfg(test)]
                 mock_read_result: None,
+                #[cfg(test)]
+                mock_message_result: None,
             }),
         })
     }
@@ -242,37 +263,42 @@ async fn handle_rpc(value: Value, state: &ContextMcpState) -> RpcOutcome {
                 "protocolVersion": MCP_PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "openab-context", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "Use read_current_thread only when the user request depends on prior Discord or Slack thread context. Prefer small limits and current sender_context routing fields.",
+                "instructions": mcp_instructions(state),
             }),
         )),
         "notifications/initialized" => RpcOutcome::Accepted,
-        "tools/list" => RpcOutcome::Response(json_rpc_result(
-            id.unwrap_or(Value::Null),
-            json!({"tools": [read_current_thread_tool()]}),
-        )),
+        "tools/list" => {
+            let mut tools = vec![read_current_thread_tool(), read_message_tool()];
+            if state.handoff.is_some() {
+                tools.push(handoff_to_thread_tool());
+            }
+            RpcOutcome::Response(json_rpc_result(
+                id.unwrap_or(Value::Null),
+                json!({"tools": tools}),
+            ))
+        }
         "tools/call" => {
             let id = id.unwrap_or(Value::Null);
             let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if name != TOOL_READ_CURRENT_THREAD {
-                return RpcOutcome::Response(json_rpc_error(
+            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+            match name {
+                TOOL_READ_CURRENT_THREAD => match read_current_thread(args, state).await {
+                    Ok(result) => tool_result_response(id, result),
+                    Err(e) => RpcOutcome::Response(json_rpc_error(id, -32000, &e.to_string())),
+                },
+                TOOL_READ_MESSAGE => match read_message(args, state).await {
+                    Ok(result) => tool_result_response(id, result),
+                    Err(e) => RpcOutcome::Response(json_rpc_error(id, -32000, &e.to_string())),
+                },
+                TOOL_HANDOFF_TO_THREAD => match handoff_to_thread(args, state).await {
+                    Ok(result) => tool_result_response(id, result),
+                    Err(e) => RpcOutcome::Response(json_rpc_error(id, -32000, &e.to_string())),
+                },
+                _ => RpcOutcome::Response(json_rpc_error(
                     id,
                     -32602,
                     &format!("unknown tool: {name}"),
-                ));
-            }
-            let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-            match read_current_thread(args, state).await {
-                Ok(result) => {
-                    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
-                    RpcOutcome::Response(json_rpc_result(
-                        id,
-                        json!({
-                            "content": [{"type": "text", "text": text}],
-                            "structuredContent": result,
-                        }),
-                    ))
-                }
-                Err(e) => RpcOutcome::Response(json_rpc_error(id, -32000, &e.to_string())),
+                )),
             }
         }
         _ => RpcOutcome::Response(json_rpc_error(
@@ -281,6 +307,17 @@ async fn handle_rpc(value: Value, state: &ContextMcpState) -> RpcOutcome {
             &format!("method not found: {method}"),
         )),
     }
+}
+
+fn tool_result_response<T: Serialize>(id: Value, result: T) -> RpcOutcome {
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    RpcOutcome::Response(json_rpc_result(
+        id,
+        json!({
+            "content": [{"type": "text", "text": text}],
+            "structuredContent": result,
+        }),
+    ))
 }
 
 fn authorized<B>(req: &Request<B>, expected: &str) -> bool {
@@ -295,10 +332,18 @@ fn authorized<B>(req: &Request<B>, expected: &str) -> bool {
         .is_some_and(|token| token == expected)
 }
 
+fn mcp_instructions(state: &ContextMcpState) -> &'static str {
+    if state.handoff.is_some() {
+        "Use read_message for sender_context referenced_message_id/referenced_channel_id lookups. Use read_current_thread only when the user request depends on prior Discord or Slack thread/channel context. Prefer small limits and current sender_context routing fields. When sender_context contains handoff_token and the user request is complex enough to deserve an isolated thread, call handoff_to_thread with a concise title and a complete task prompt; after it succeeds, only acknowledge the created thread in the parent channel."
+    } else {
+        "Use read_message for sender_context referenced_message_id/referenced_channel_id lookups. Use read_current_thread only when the user request depends on prior Discord or Slack thread/channel context. Prefer small limits and current sender_context routing fields."
+    }
+}
+
 fn read_current_thread_tool() -> Value {
     json!({
         "name": TOOL_READ_CURRENT_THREAD,
-        "description": "Read bounded history from the current OpenAB Discord or Slack thread/DM. Use channel/thread ids from <sender_context>.",
+        "description": "Read bounded history from the current OpenAB Discord or Slack thread/DM, or normal channel when explicitly enabled by OpenAB config. Use channel/thread ids from <sender_context>.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -330,6 +375,72 @@ fn read_current_thread_tool() -> Value {
     })
 }
 
+fn read_message_tool() -> Value {
+    json!({
+        "name": TOOL_READ_MESSAGE,
+        "description": "Read one Discord or Slack message by platform channel id and message id. Use sender_context.referenced_channel_id and referenced_message_id for quoted Discord messages.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "platform": {
+                    "type": "string",
+                    "enum": ["discord", "slack"],
+                    "description": "The sender_context channel/platform value."
+                },
+                "channel_id": {
+                    "type": "string",
+                    "description": "Discord channel id containing the message, or Slack channel id."
+                },
+                "thread_id": {
+                    "type": "string",
+                    "description": "Optional Slack thread_ts when reading a threaded Slack reply."
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Discord message id or Slack message ts to read."
+                }
+            },
+            "required": ["platform", "channel_id", "message_id"]
+        }
+    })
+}
+
+fn handoff_to_thread_tool() -> Value {
+    json!({
+        "name": TOOL_HANDOFF_TO_THREAD,
+        "description": "Start an isolated thread-backed task for the current inline normal-channel message. Use only when sender_context includes handoff_token and the task is complex enough to move out of the parent channel. Returns after the child task is created and enqueued; do not wait for the child result, and only acknowledge the created thread in the parent response.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "handoff_token": {
+                    "type": "string",
+                    "description": "The short-lived sender_context.handoff_token for the current message."
+                },
+                "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HANDOFF_TITLE_CHARS,
+                    "description": "Concise thread title for the delegated task."
+                },
+                "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_HANDOFF_PROMPT_CHARS,
+                    "description": "Complete task prompt to run as the first prompt in the new thread session."
+                }
+            },
+            "required": ["handoff_token", "title", "prompt"]
+        }
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct HandoffToolRequest {
+    handoff_token: String,
+    title: String,
+    prompt: String,
+}
+
 async fn read_current_thread(args: Value, state: &ContextMcpState) -> Result<ThreadReadResult> {
     let req = parse_read_request(&args)?;
     if !state.allowed_platforms.is_empty() && !state.allowed_platforms.contains(&req.platform) {
@@ -356,6 +467,69 @@ async fn read_current_thread(args: Value, state: &ContextMcpState) -> Result<Thr
                 .as_ref()
                 .ok_or_else(|| anyhow!("Slack is not configured"))?;
             read_slack_thread(&state.http, &state.slack_api_base, slack, req, limit).await
+        }
+        other => anyhow::bail!("unsupported platform: {other}"),
+    }
+}
+
+async fn handoff_to_thread(
+    args: Value,
+    state: &ContextMcpState,
+) -> Result<crate::handoff::HandoffStarted> {
+    let Some(handoff) = state.handoff.as_ref() else {
+        anyhow::bail!("handoff_to_thread is not enabled");
+    };
+    let req: HandoffToolRequest = serde_json::from_value(args)
+        .map_err(|e| anyhow!("invalid handoff_to_thread arguments: {e}"))?;
+    let token = req.handoff_token.trim();
+    let title = req.title.trim();
+    let prompt = req.prompt.trim();
+    if token.is_empty() {
+        anyhow::bail!("handoff_token must not be empty");
+    }
+    if title.is_empty() {
+        anyhow::bail!("title must not be empty");
+    }
+    if title.chars().count() > MAX_HANDOFF_TITLE_CHARS {
+        anyhow::bail!("title must be at most {MAX_HANDOFF_TITLE_CHARS} characters");
+    }
+    if prompt.is_empty() {
+        anyhow::bail!("prompt must not be empty");
+    }
+    if prompt.chars().count() > MAX_HANDOFF_PROMPT_CHARS {
+        anyhow::bail!("prompt must be at most {MAX_HANDOFF_PROMPT_CHARS} characters");
+    }
+
+    handoff.start_thread_task(token, title, prompt).await
+}
+
+async fn read_message(args: Value, state: &ContextMcpState) -> Result<MessageReadResult> {
+    let req = parse_read_request(&args)?;
+    if req.message_id.is_none() {
+        anyhow::bail!("missing required argument: message_id");
+    }
+    if !state.allowed_platforms.is_empty() && !state.allowed_platforms.contains(&req.platform) {
+        anyhow::bail!("platform is not enabled for context MCP: {}", req.platform);
+    }
+    #[cfg(test)]
+    if let Some(result) = state.mock_message_result.clone() {
+        return Ok(result);
+    }
+
+    match req.platform.as_str() {
+        "discord" => {
+            let discord = state
+                .discord
+                .as_ref()
+                .ok_or_else(|| anyhow!("Discord is not configured"))?;
+            read_discord_message(&state.http, &state.discord_api_base, discord, req).await
+        }
+        "slack" => {
+            let slack = state
+                .slack
+                .as_ref()
+                .ok_or_else(|| anyhow!("Slack is not configured"))?;
+            read_slack_message(&state.http, &state.slack_api_base, slack, req).await
         }
         other => anyhow::bail!("unsupported platform: {other}"),
     }
@@ -460,6 +634,45 @@ async fn read_discord_thread(
     })
 }
 
+async fn read_discord_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    discord: &DiscordContext,
+    req: ReadRequest,
+) -> Result<MessageReadResult> {
+    let message_id = req
+        .message_id
+        .clone()
+        .ok_or_else(|| anyhow!("missing required argument: message_id"))?;
+    let target_id = req.channel_id.clone();
+    let channel = discord_get(
+        client,
+        api_base,
+        &discord.token,
+        &format!("/channels/{target_id}"),
+    )
+    .await?;
+    let parent_id = channel
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    validate_discord_message_scope(discord, &req, &target_id, parent_id.as_ref())?;
+
+    let message = discord_get(
+        client,
+        api_base,
+        &discord.token,
+        &format!("/channels/{target_id}/messages/{message_id}"),
+    )
+    .await?;
+    Ok(MessageReadResult {
+        platform: "discord".into(),
+        channel_id: req.channel_id,
+        thread_id: req.thread_id,
+        message: normalize_discord_message(message),
+    })
+}
+
 fn validate_discord_channel_scope(
     discord: &DiscordContext,
     req: &ReadRequest,
@@ -471,6 +684,22 @@ fn validate_discord_channel_scope(
     if !is_thread && !is_dm && !discord.allow_normal_channels {
         anyhow::bail!("Discord normal channel history is not available through this tool");
     }
+    if !discord.allow_all_channels
+        && !discord.allowed_channels.contains(&req.channel_id)
+        && !discord.allowed_channels.contains(target_id)
+        && !parent_id.is_some_and(|p| discord.allowed_channels.contains(p))
+    {
+        anyhow::bail!("Discord channel is not allowed for context reads");
+    }
+    Ok(())
+}
+
+fn validate_discord_message_scope(
+    discord: &DiscordContext,
+    req: &ReadRequest,
+    target_id: &str,
+    parent_id: Option<&String>,
+) -> Result<()> {
     if !discord.allow_all_channels
         && !discord.allowed_channels.contains(&req.channel_id)
         && !discord.allowed_channels.contains(target_id)
@@ -566,8 +795,9 @@ async fn read_slack_thread(
     req: ReadRequest,
     limit: usize,
 ) -> Result<ThreadReadResult> {
-    if !slack.allow_all_channels && !slack.allowed_channels.contains(&req.channel_id) {
-        anyhow::bail!("Slack channel is not allowed for context reads");
+    validate_slack_channel_scope(slack, &req)?;
+    if req.thread_id.is_none() && slack.allow_normal_channels {
+        return read_slack_channel_history(client, api_base, slack, req, limit).await;
     }
     let thread_ts = req
         .thread_id
@@ -608,6 +838,129 @@ async fn read_slack_thread(
         messages,
         limit,
     })
+}
+
+async fn read_slack_channel_history(
+    client: &reqwest::Client,
+    api_base: &str,
+    slack: &SlackContext,
+    req: ReadRequest,
+    limit: usize,
+) -> Result<ThreadReadResult> {
+    let mut query = vec![
+        ("channel", req.channel_id.clone()),
+        ("limit", limit.to_string()),
+        ("inclusive", "true".to_string()),
+    ];
+    if let Some(message_id) = req.message_id.as_ref() {
+        query.push(("latest", message_id.clone()));
+    }
+
+    let resp = client
+        .get(format!(
+            "{}/conversations.history",
+            api_base.trim_end_matches('/')
+        ))
+        .header(AUTHORIZATION, format!("Bearer {}", slack.token))
+        .query(&query)
+        .send()
+        .await?;
+    let json: Value = resp.json().await?;
+    if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        anyhow::bail!("Slack API conversations.history: {err}");
+    }
+    let mut messages = json
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .cloned()
+                .map(normalize_slack_message)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    messages.reverse();
+
+    Ok(ThreadReadResult {
+        platform: "slack".into(),
+        channel_id: req.channel_id,
+        thread_id: None,
+        messages,
+        limit,
+    })
+}
+
+async fn read_slack_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    slack: &SlackContext,
+    req: ReadRequest,
+) -> Result<MessageReadResult> {
+    validate_slack_channel_scope(slack, &req)?;
+    let message_id = req
+        .message_id
+        .clone()
+        .ok_or_else(|| anyhow!("missing required argument: message_id"))?;
+
+    let endpoint = if req.thread_id.is_some() {
+        "conversations.replies"
+    } else {
+        "conversations.history"
+    };
+    let mut query = vec![
+        ("channel", req.channel_id.clone()),
+        ("latest", message_id.clone()),
+        ("limit", "1".to_string()),
+        ("inclusive", "true".to_string()),
+    ];
+    if let Some(thread_id) = req.thread_id.clone() {
+        query.push(("ts", thread_id));
+    }
+
+    let resp = client
+        .get(format!("{}/{}", api_base.trim_end_matches('/'), endpoint))
+        .header(AUTHORIZATION, format!("Bearer {}", slack.token))
+        .query(&query)
+        .send()
+        .await?;
+    let json: Value = resp.json().await?;
+    if json.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        let err = json
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        anyhow::bail!("Slack API {endpoint}: {err}");
+    }
+    let message = json
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|msg| msg.get("ts").and_then(|v| v.as_str()) == Some(message_id.as_str()))
+                .or_else(|| items.first())
+        })
+        .cloned()
+        .ok_or_else(|| anyhow!("Slack message not found"))?;
+
+    Ok(MessageReadResult {
+        platform: "slack".into(),
+        channel_id: req.channel_id,
+        thread_id: req.thread_id,
+        message: normalize_slack_message(message),
+    })
+}
+
+fn validate_slack_channel_scope(slack: &SlackContext, req: &ReadRequest) -> Result<()> {
+    if !slack.allow_all_channels && !slack.allowed_channels.contains(&req.channel_id) {
+        anyhow::bail!("Slack channel is not allowed for context reads");
+    }
+    Ok(())
 }
 
 fn normalize_slack_message(msg: Value) -> NormalizedMessage {
@@ -700,10 +1053,12 @@ mod tests {
             allowed_platforms: HashSet::new(),
             discord: None,
             slack: None,
+            handoff: None,
             discord_api_base: DISCORD_API_BASE.into(),
             slack_api_base: SLACK_API_BASE.into(),
             http: reqwest::Client::new(),
             mock_read_result: None,
+            mock_message_result: None,
         }
     }
 
@@ -770,8 +1125,36 @@ mod tests {
         validate_discord_channel_scope(&discord, &req, "C1", false, false, None).unwrap();
     }
 
+    #[test]
+    fn slack_context_reads_still_require_allowed_channel() {
+        let req = ReadRequest {
+            platform: "slack".into(),
+            channel_id: "C1".into(),
+            thread_id: None,
+            message_id: None,
+            limit: None,
+        };
+        let slack = SlackContext {
+            token: "token".into(),
+            allow_all_channels: false,
+            allowed_channels: HashSet::new(),
+            allow_normal_channels: true,
+        };
+
+        let err = validate_slack_channel_scope(&slack, &req).unwrap_err();
+        assert!(err.to_string().contains("Slack channel is not allowed"));
+
+        let mut allowed_channels = HashSet::new();
+        allowed_channels.insert("C1".to_string());
+        let slack = SlackContext {
+            allowed_channels,
+            ..slack
+        };
+        validate_slack_channel_scope(&slack, &req).unwrap();
+    }
+
     #[tokio::test]
-    async fn tools_list_exposes_read_current_thread() {
+    async fn tools_list_exposes_context_tools() {
         let state = test_state();
         let RpcOutcome::Response(value) = handle_rpc(
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
@@ -785,10 +1168,35 @@ mod tests {
             value["result"]["tools"][0]["name"],
             TOOL_READ_CURRENT_THREAD
         );
+        assert_eq!(value["result"]["tools"][1]["name"], TOOL_READ_MESSAGE);
+        assert_eq!(value["result"]["tools"].as_array().unwrap().len(), 2);
         assert_eq!(
             value["result"]["tools"][0]["inputSchema"]["required"][0],
             "platform"
         );
+    }
+
+    #[tokio::test]
+    async fn tools_list_exposes_handoff_tool_only_when_enabled() {
+        let mut state = test_state();
+        state.handoff = Some(Arc::new(crate::handoff::HandoffBroker::new(
+            std::time::Duration::from_secs(60),
+        )));
+        let RpcOutcome::Response(value) = handle_rpc(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            &state,
+        )
+        .await
+        else {
+            panic!("expected JSON-RPC response");
+        };
+        let names: Vec<&str> = value["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(names.contains(&TOOL_HANDOFF_TO_THREAD));
     }
 
     #[tokio::test]
@@ -812,6 +1220,82 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_handoff_rejects_invalid_token() {
+        let mut state = test_state();
+        state.handoff = Some(Arc::new(crate::handoff::HandoffBroker::new(
+            std::time::Duration::from_secs(60),
+        )));
+        let RpcOutcome::Response(value) = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": TOOL_HANDOFF_TO_THREAD,
+                    "arguments": {
+                        "handoff_token": "missing",
+                        "title": "Investigate issue",
+                        "prompt": "Please investigate the issue."
+                    }
+                }
+            }),
+            &state,
+        )
+        .await
+        else {
+            panic!("expected JSON-RPC response");
+        };
+        assert_eq!(value["error"]["code"], -32000);
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("handoff token"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_reads_single_message() {
+        let mut state = test_state();
+        state.mock_message_result = Some(MessageReadResult {
+            platform: "discord".into(),
+            channel_id: "C1".into(),
+            thread_id: None,
+            message: NormalizedMessage {
+                id: "M1".into(),
+                author_id: Some("U1".into()),
+                author_name: Some("alice".into()),
+                timestamp: Some("2026-06-30T00:00:00.000000+00:00".into()),
+                text: "old context".into(),
+                attachments: Vec::new(),
+            },
+        });
+
+        let RpcOutcome::Response(value) = handle_rpc(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": TOOL_READ_MESSAGE,
+                    "arguments": {
+                        "platform": "discord",
+                        "channel_id": "C1",
+                        "message_id": "M1"
+                    }
+                }
+            }),
+            &state,
+        )
+        .await
+        else {
+            panic!("expected JSON-RPC response");
+        };
+        assert_eq!(
+            value["result"]["structuredContent"]["message"]["text"],
+            "old context"
+        );
     }
 
     #[tokio::test]
@@ -874,6 +1358,17 @@ mod tests {
         assert_eq!(parsed.thread_id.as_deref(), Some("T1"));
         assert_eq!(parsed.limit, Some(25));
         assert!(parse_read_request(&json!({"platform": "discord"})).is_err());
+    }
+
+    #[test]
+    fn parse_read_request_accepts_message_id_for_direct_reads() {
+        let parsed = parse_read_request(&json!({
+            "platform": "discord",
+            "channel_id": "C1",
+            "message_id": "M1"
+        }))
+        .unwrap();
+        assert_eq!(parsed.message_id.as_deref(), Some("M1"));
     }
 
     #[test]

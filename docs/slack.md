@@ -70,6 +70,24 @@ allowed_channels = []                # empty = allow all channels
 # allowed_users = ["U0123456789"]    # empty = allow all users
 ```
 
+### Normal-channel inline replies and handoff
+
+By default, normal-channel `@OpenAB` mentions reply in a Slack thread rooted at
+the triggering message. Set inline mode when you want the bot to answer as a
+top-level channel message instead:
+
+```toml
+[slack]
+normal_channel_reply_mode = "inline"
+```
+
+When `[context_mcp] handoff_enabled = true` and the OpenAB MCP server is
+injected into the agent, inline normal-channel turns include a short-lived
+`handoff_token` in `<sender_context>`. The agent can call `handoff_to_thread`
+with that token, a title, and a task prompt to route the supplied prompt to a
+new Slack thread rooted at the original user message timestamp. The parent
+inline reply should only acknowledge the created thread.
+
 Set the environment variables:
 
 ```bash

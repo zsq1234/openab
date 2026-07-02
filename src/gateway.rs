@@ -697,6 +697,11 @@ pub async fn run_gateway_adapter(
                                         }),
                                         message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
                                         receiver_id: None, // gateway does not yet resolve receiver identity
+                                        handoff_token: None,
+                                        referenced_message_id: None,
+                                        referenced_channel_id: None,
+                                        referenced_author_id: None,
+                                        referenced_author_name: None,
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();
@@ -892,6 +897,8 @@ pub async fn run_gateway_adapter(
                                             // TODO: implement gateway multibot detection
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
+                                            initial_reply_to: None,
+                                            session_key_override: None,
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)

@@ -1,7 +1,7 @@
 use crate::acp::protocol::{
     parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
 };
-use crate::config::{AgentConfig, AgentTransport};
+use crate::config::{AgentConfig, AgentMcpServerConfig, AgentTransport};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -162,6 +162,7 @@ pub struct AcpConnection {
     pub config_options: Vec<ConfigOption>,
     pub last_active: Instant,
     pub session_reset: bool,
+    mcp_servers: Value,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
 }
@@ -194,6 +195,28 @@ fn build_agent_env(
 
 fn websocket_client_id(thread_key: &str) -> &str {
     thread_key.rsplit(':').next().unwrap_or(thread_key)
+}
+
+fn mcp_servers_json(servers: &[AgentMcpServerConfig]) -> Value {
+    let mut items = Vec::new();
+    for server in servers {
+        let mut cfg = serde_json::Map::new();
+        cfg.insert("name".into(), Value::String(server.name.clone()));
+        cfg.insert("type".into(), Value::String(server.transport.clone()));
+        cfg.insert("url".into(), Value::String(server.url.clone()));
+        if !server.headers.is_empty() {
+            cfg.insert("headers".into(), json!(server.headers));
+        }
+        if !server.allowed_tools.is_empty() {
+            cfg.insert(
+                "tool_filter".into(),
+                json!({ "allow": server.allowed_tools }),
+            );
+            cfg.insert("allowedTools".into(), json!(server.allowed_tools));
+        }
+        items.push(Value::Object(cfg));
+    }
+    Value::Array(items)
 }
 
 async fn finish_reader_loop(
@@ -445,6 +468,7 @@ async fn run_ws_reader_loop(
 
 impl AcpConnection {
     pub async fn spawn(config: &AgentConfig, working_dir: &str, thread_key: &str) -> Result<Self> {
+        let mcp_servers = mcp_servers_json(&config.mcp_servers);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
@@ -604,6 +628,7 @@ impl AcpConnection {
                     config_options: Vec::new(),
                     last_active: Instant::now(),
                     session_reset: false,
+                    mcp_servers,
                     _reader_handle: reader_handle,
                     _stderr_handle: stderr_handle,
                 })
@@ -655,6 +680,7 @@ impl AcpConnection {
                     config_options: Vec::new(),
                     last_active: Instant::now(),
                     session_reset: false,
+                    mcp_servers,
                     _reader_handle: reader_handle,
                     _stderr_handle: None,
                 })
@@ -726,7 +752,10 @@ impl AcpConnection {
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request(
+                "session/new",
+                Some(json!({"cwd": cwd, "mcpServers": self.mcp_servers.clone()})),
+            )
             .await?;
 
         let session_id = resp
@@ -895,7 +924,11 @@ impl AcpConnection {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(json!({
+                    "sessionId": session_id,
+                    "cwd": cwd,
+                    "mcpServers": self.mcp_servers.clone(),
+                })),
             )
             .await?;
         // Accept any non-error response as success
@@ -951,7 +984,8 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{build_agent_env, build_permission_response, mcp_servers_json, pick_best_option};
+    use crate::config::AgentMcpServerConfig;
     use serde_json::json;
 
     #[test]
@@ -1083,6 +1117,39 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[test]
+    fn mcp_servers_json_empty_preserves_legacy_empty_array() {
+        assert_eq!(mcp_servers_json(&[]), json!([]));
+    }
+
+    #[test]
+    fn mcp_servers_json_uses_sequence_items() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("Authorization".to_string(), "Bearer secret".to_string());
+        let servers = vec![AgentMcpServerConfig {
+            name: "openab_context".into(),
+            transport: "http".into(),
+            url: "http://openab:18080/mcp".into(),
+            headers,
+            allowed_tools: vec!["handoff_to_thread".into()],
+        }];
+
+        let value = mcp_servers_json(&servers);
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "name": "openab_context",
+                    "type": "http",
+                    "url": "http://openab:18080/mcp",
+                    "headers": {"Authorization": "Bearer secret"},
+                    "tool_filter": {"allow": ["handoff_to_thread"]},
+                    "allowedTools": ["handoff_to_thread"]
+                }
+            ])
+        );
     }
 }
 

@@ -27,6 +27,7 @@ Each agent lives under `agents.<name>`.
 | `discord.allowDm` | Whether the Discord bot responds to direct messages. | `false` |
 | `discord.allowBotMessages` | Controls whether bot messages can trigger replies. | `"off"` |
 | `discord.trustedBotIds` | Optional bot ID allowlist when bot-message replies are enabled. | `[]` |
+| `discord.normalChannelReplyMode` | Normal-channel `@bot` behavior: `"thread"` creates/uses a Discord thread, `"inline"` replies in the current channel and references the trigger message. | `"thread"` |
 | `slack.enabled` | Enable the Slack adapter for the agent. | `false` |
 | `slack.botToken` | Slack Bot User OAuth token. | `""` |
 | `slack.appToken` | Slack App-Level token for Socket Mode. | `""` |
@@ -46,6 +47,10 @@ Each agent lives under `agents.<name>`.
 | `stt.apiKey` | API key for the speech-to-text provider. | `""` |
 | `stt.model` | STT model name. | `"whisper-large-v3-turbo"` |
 | `stt.baseUrl` | STT API base URL. | `"https://api.groq.com/openai/v1"` |
+| `contextMcp.enabled` | Enable the OpenAB Streamable HTTP MCP server. | `false` |
+| `contextMcp.handoffEnabled` | Expose `handoff_to_thread` so inline normal-channel agents can start thread-backed child tasks. | `false` |
+| `contextMcp.injectIntoAgent` | Inject this OpenAB MCP endpoint into ACP session `mcpServers`. | `false` |
+| `contextMcp.agentUrl` | Agent-reachable MCP URL; when empty and injection is enabled, the chart renders the per-agent ClusterIP service URL. | `""` |
 | `gateway.enabled` | Enable the gateway config block for webhook-based platforms. | `false` |
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |

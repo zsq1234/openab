@@ -211,6 +211,10 @@ pub struct MessageContext {
     pub extra_blocks: Vec<ContentBlock>,
     pub trigger_msg: MessageRef,
     pub other_bot_present: bool,
+    /// Force the first visible reply to reference this platform message ID.
+    /// Used for Discord inline channel replies; model-emitted [[reply_to]]
+    /// directives still take precedence when present.
+    pub initial_reply_to: Option<String>,
 }
 
 /// Sender identity injected into prompts for downstream agent context.
@@ -249,6 +253,23 @@ pub struct SenderContext {
     /// Enables agents to identify themselves when multiple agents share the same backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_id: Option<String>,
+    /// Short-lived token that allows the agent to hand this normal-channel
+    /// message off to a new thread-backed session through OpenAB MCP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handoff_token: Option<String>,
+    /// Platform message ID referenced by this message, if the platform exposes one.
+    /// Discord: message_reference.message_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_message_id: Option<String>,
+    /// Platform channel ID containing `referenced_message_id`.
+    /// Discord: message_reference.channel_id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_channel_id: Option<String>,
+    /// Best-effort referenced message author metadata, when included in the event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_author_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub referenced_author_name: Option<String>,
 }
 
 // --- ChatAdapter trait ---
@@ -548,6 +569,7 @@ impl AdapterRouter {
                 &ctx.thread_channel,
                 reactions.clone(),
                 ctx.other_bot_present,
+                ctx.initial_reply_to,
             )
             .await;
 
@@ -580,6 +602,7 @@ impl AdapterRouter {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_prompt(
         &self,
         adapter: &Arc<dyn ChatAdapter>,
@@ -588,6 +611,7 @@ impl AdapterRouter {
         thread_channel: &ChannelRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
+        initial_reply_to: Option<String>,
     ) -> Result<()> {
         self.stream_prompt_blocks(
             adapter,
@@ -599,6 +623,7 @@ impl AdapterRouter {
             // handle_message path (e.g. cron) is never Slack assistant-mode native
             // streaming, so no per-turn recipient — degrades to post+edit if it were.
             None,
+            initial_reply_to,
         )
         .await
     }
@@ -616,6 +641,7 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
+        initial_reply_to: Option<String>,
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
@@ -699,7 +725,13 @@ impl AdapterRouter {
                         } else {
                             "…".to_string()
                         };
-                        let msg = adapter.send_message(&thread_channel, &initial).await?;
+                        let msg = if let Some(reply_id) = initial_reply_to.as_deref() {
+                            adapter
+                                .send_message_with_reply(&thread_channel, &initial, reply_id)
+                                .await?
+                        } else {
+                            adapter.send_message(&thread_channel, &initial).await?
+                        };
                         tracing::debug!(
                             thread_key,
                             request_id,
@@ -957,6 +989,7 @@ impl AdapterRouter {
                     // Directives are agent meta-layer, not content — must be stripped
                     // before tool lines are composed into the display output.
                     let (directives, stripped_text) = parse_output_directives(&text_buf);
+                    let effective_reply_to = directives.reply_to.or(initial_reply_to);
                     let text_buf = stripped_text;
 
                     // Build final content
@@ -1042,19 +1075,20 @@ impl AdapterRouter {
                             }
                         }
                     } else if let Some(msg) = placeholder_msg {
-                        if let Some(ref reply_id) = directives.reply_to {
+                        if let Some(ref reply_id) = effective_reply_to {
                             // reply_to directive: send reply first, then delete placeholder.
                             // Only delete if send succeeds — preserves placeholder on failure.
                             let mut send_ok = false;
                             let mut first = true;
                             for chunk in &chunks {
                                 if first {
-                                    match adapter.send_message_with_reply(
-                                        &thread_channel,
-                                        chunk,
-                                        reply_id,
-                                    ).await {
-                                        Ok(_) => { send_ok = true; }
+                                    match adapter
+                                        .send_message_with_reply(&thread_channel, chunk, reply_id)
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            send_ok = true;
+                                        }
                                         Err(e) => {
                                             tracing::warn!(error = ?e, "reply_to send failed; preserving placeholder");
                                         }
@@ -1091,7 +1125,7 @@ impl AdapterRouter {
                         let mut first = true;
                         for chunk in &chunks {
                             if first {
-                                if let Some(ref reply_id) = directives.reply_to {
+                                if let Some(ref reply_id) = effective_reply_to {
                                     let _ = adapter.send_message_with_reply(
                                         &thread_channel,
                                         chunk,
