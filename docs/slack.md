@@ -97,7 +97,9 @@ export SLACK_APP_TOKEN="xapp-..."
 
 ### Assistant Mode (default: enabled)
 
-`assistant_mode` is **enabled by default**. This uses Slack's native AI-app APIs for streaming (`chat.startStream`/`appendStream`/`stopStream`) and status indicators (`assistant.threads.setStatus`) instead of the legacy post+edit loop and emoji reactions.
+`assistant_mode` is **enabled by default**. This uses Slack's native AI-app APIs for streaming (`chat.startStream`/`appendStream`/`stopStream`) and, in Slack Assistant DM/app threads, status indicators (`assistant.threads.setStatus`).
+
+Normal channels and ordinary Slack threads keep emoji-reaction status indicators because Slack assistant thread status is not valid for those routes.
 
 **Requirements:** Your Slack app must be an [AI app](https://api.slack.com/docs/apps/ai) with the `assistant:write` scope. If your app already has `chat:write`, you only need to add `assistant:write` and reinstall.
 
@@ -108,7 +110,7 @@ export SLACK_APP_TOKEN="xapp-..."
 assistant_mode = false
 ```
 
-This keeps the previous behavior: post+edit streaming with emoji reactions (👀 / ✅ / ❌) for status indicators. Without this opt-out, message delivery still works (native streaming degrades to post+edit automatically), but thinking/tool-use indicators will not be visible.
+This keeps the previous behavior: post+edit streaming with emoji reactions (👀 / ✅ / ❌) for status indicators. Without this opt-out, message delivery still works (native streaming degrades to post+edit automatically), and normal channels / ordinary Slack threads continue to use emoji status indicators.
 
 ## 7. Invite the Bot
 
@@ -180,14 +182,15 @@ On Discord, none of these apply: slash commands work in thread-channels, the cha
 
 1. Verify `reactions:write` scope is added
 2. Reinstall the app after adding the scope
-3. If `assistant_mode = true` (the default), emoji reactions are intentionally suppressed — status is shown via the assistant status line instead. Set `assistant_mode = false` if you want emoji reactions back.
+3. If `assistant_mode = true` (the default), emoji reactions are intentionally suppressed only in Slack Assistant DM/app threads where the assistant status line is available. Normal channels and ordinary Slack threads still use emoji reactions.
 
 ### Assistant status line not showing ("Thinking…" / "Using tool…")
 
 1. Verify your Slack app is configured as an [AI app](https://api.slack.com/docs/apps/ai)
 2. Verify `assistant:write` scope is added under **Bot Token Scopes**
 3. Reinstall the app after adding the scope
-4. If your app cannot be an AI app, set `assistant_mode = false` to use emoji reactions instead
+4. Confirm the conversation is a Slack Assistant DM/app thread. Normal channels and ordinary Slack threads use emoji status instead.
+5. If your app cannot be an AI app, set `assistant_mode = false` to use emoji reactions everywhere.
 
 ### Native streaming not working (replies appear all at once)
 

@@ -186,6 +186,13 @@ pub struct ContextMcpConfig {
     /// Lifetime for a handoff token in seconds.
     #[serde(default = "default_context_mcp_handoff_token_ttl_secs")]
     pub handoff_token_ttl_secs: u64,
+    /// Reply to the original normal-channel handoff message with a concise
+    /// parent-agent summary after the initial child thread turn completes.
+    #[serde(default)]
+    pub handoff_parent_summary_enabled: bool,
+    /// Maximum characters sent in the parent-channel handoff completion summary.
+    #[serde(default = "default_context_mcp_handoff_parent_summary_max_chars")]
+    pub handoff_parent_summary_max_chars: usize,
     /// Inject this OpenAB MCP endpoint into ACP session/new and session/load.
     #[serde(default)]
     pub inject_into_agent: bool,
@@ -214,6 +221,9 @@ impl Default for ContextMcpConfig {
             allow_normal_channels: false,
             handoff_enabled: false,
             handoff_token_ttl_secs: default_context_mcp_handoff_token_ttl_secs(),
+            handoff_parent_summary_enabled: false,
+            handoff_parent_summary_max_chars: default_context_mcp_handoff_parent_summary_max_chars(
+            ),
             inject_into_agent: false,
             agent_url: None,
             agent_server_name: default_context_mcp_agent_server_name(),
@@ -240,6 +250,10 @@ fn default_context_mcp_max_limit() -> usize {
 
 fn default_context_mcp_handoff_token_ttl_secs() -> u64 {
     300
+}
+
+fn default_context_mcp_handoff_parent_summary_max_chars() -> usize {
+    400
 }
 
 fn default_context_mcp_agent_server_name() -> String {
@@ -1310,6 +1324,12 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
             "context_mcp.enabled must be true when context_mcp.handoff_enabled = true"
         );
     }
+    if config.context_mcp.handoff_parent_summary_enabled {
+        anyhow::ensure!(
+            config.context_mcp.handoff_enabled,
+            "context_mcp.handoff_enabled must be true when context_mcp.handoff_parent_summary_enabled = true"
+        );
+    }
     if config.context_mcp.inject_into_agent {
         anyhow::ensure!(
             config.context_mcp.enabled,
@@ -1367,6 +1387,10 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         anyhow::ensure!(
             config.context_mcp.handoff_token_ttl_secs > 0,
             "context_mcp.handoff_token_ttl_secs must be > 0"
+        );
+        anyhow::ensure!(
+            config.context_mcp.handoff_parent_summary_max_chars > 0,
+            "context_mcp.handoff_parent_summary_max_chars must be > 0"
         );
         for tool in &config.context_mcp.agent_allowed_tools {
             anyhow::ensure!(
@@ -1615,6 +1639,8 @@ command = "echo"
         assert!(!cfg.context_mcp.allow_normal_channels);
         assert!(!cfg.context_mcp.handoff_enabled);
         assert_eq!(cfg.context_mcp.handoff_token_ttl_secs, 300);
+        assert!(!cfg.context_mcp.handoff_parent_summary_enabled);
+        assert_eq!(cfg.context_mcp.handoff_parent_summary_max_chars, 400);
         assert!(!cfg.context_mcp.inject_into_agent);
         assert!(cfg.context_mcp.agent_url.is_none());
         assert_eq!(cfg.context_mcp.agent_server_name, "openab_context");
@@ -1709,6 +1735,42 @@ handoff_enabled = true
             .to_string();
         assert!(err.contains("context_mcp.enabled must be true"));
 
+        let summary_without_handoff = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+handoff_parent_summary_enabled = true
+"#;
+        let err = parse_config(summary_without_handoff, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_mcp.handoff_enabled must be true"));
+
+        let zero_summary_chars = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[context_mcp]
+enabled = true
+token = "secret"
+handoff_enabled = true
+handoff_parent_summary_enabled = true
+handoff_parent_summary_max_chars = 0
+"#;
+        let err = parse_config(zero_summary_chars, "test")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_mcp.handoff_parent_summary_max_chars must be > 0"));
+
         let inject_without_url = r#"
 [discord]
 bot_token = "test-token"
@@ -1762,6 +1824,8 @@ allowed_platforms = ["discord"]
 allow_normal_channels = true
 handoff_enabled = true
 handoff_token_ttl_secs = 120
+handoff_parent_summary_enabled = true
+handoff_parent_summary_max_chars = 240
 inject_into_agent = true
 agent_url = "http://openab-core:18080/openab-codex/"
 agent_server_name = "openab_handoff"
@@ -1780,6 +1844,8 @@ agent_allowed_tools = ["read_current_thread"]
         assert!(cfg.context_mcp.allow_normal_channels);
         assert!(cfg.context_mcp.handoff_enabled);
         assert_eq!(cfg.context_mcp.handoff_token_ttl_secs, 120);
+        assert!(cfg.context_mcp.handoff_parent_summary_enabled);
+        assert_eq!(cfg.context_mcp.handoff_parent_summary_max_chars, 240);
         assert!(cfg.context_mcp.inject_into_agent);
         assert_eq!(
             cfg.context_mcp.agent_url.as_deref(),

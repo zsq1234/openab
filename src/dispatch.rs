@@ -18,9 +18,10 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, StreamPromptOutcome};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
+use crate::handoff::HandoffCompletionNotification;
 use crate::reactions::StatusReactionController;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,9 @@ pub struct BufferedMessage {
     /// Optional session key override for modes whose response route differs
     /// from their logical conversation identity.
     pub session_key_override: Option<String>,
+    /// Optional one-shot parent-channel notification for the initial child turn
+    /// created by agent thread handoff.
+    pub handoff_completion: Option<HandoffCompletionNotification>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -157,6 +161,13 @@ pub trait DispatchTarget: Send + Sync + 'static {
         other_bot_present: bool,
         recipient: Option<(String, String)>,
         initial_reply_to: Option<String>,
+    ) -> Result<StreamPromptOutcome>;
+
+    async fn summarize_handoff_completion(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        completion: &HandoffCompletionNotification,
+        sanitized_child_result: &str,
     ) -> Result<()>;
 }
 
@@ -196,7 +207,7 @@ impl DispatchTarget for AdapterRouter {
         other_bot_present: bool,
         recipient: Option<(String, String)>,
         initial_reply_to: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<StreamPromptOutcome> {
         AdapterRouter::stream_prompt_blocks(
             self,
             adapter,
@@ -207,6 +218,21 @@ impl DispatchTarget for AdapterRouter {
             other_bot_present,
             recipient,
             initial_reply_to,
+        )
+        .await
+    }
+
+    async fn summarize_handoff_completion(
+        &self,
+        adapter: &Arc<dyn ChatAdapter>,
+        completion: &HandoffCompletionNotification,
+        sanitized_child_result: &str,
+    ) -> Result<()> {
+        AdapterRouter::summarize_handoff_completion(
+            self,
+            adapter,
+            completion,
+            sanitized_child_result,
         )
         .await
     }
@@ -651,7 +677,7 @@ async fn dispatch_batch(
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
     // Skip when assistant status API is active — uses
     // assistant.threads.setStatus instead of emoji reactions.
-    let assistant_status = adapter.uses_assistant_status();
+    let assistant_status = adapter.uses_assistant_status_for(thread_channel);
     if !assistant_status {
         let queued_emoji = &target.reactions_config().emojis.queued;
         for msg in batch.iter() {
@@ -671,6 +697,7 @@ async fn dispatch_batch(
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
     let recipient: Option<(String, String)> = batch.last().and_then(|m| m.recipient.clone());
     let initial_reply_to: Option<String> = batch.last().and_then(|m| m.initial_reply_to.clone());
+    let handoff_completion = batch.iter().find_map(|m| m.handoff_completion.clone());
 
     // Anchor reactions on the last message in the batch (before consuming).
     let trigger_msg = batch.last().unwrap().trigger_msg.clone();
@@ -808,7 +835,7 @@ async fn dispatch_batch(
     // assistant.threads.setStatus — skip emoji reactions entirely.
     if !assistant_status {
         match &result {
-            Ok(()) => reactions.set_done().await,
+            Ok(_) => reactions.set_done().await,
             Err(_) => reactions.set_error().await,
         }
 
@@ -830,6 +857,18 @@ async fn dispatch_batch(
         let _ = adapter
             .send_message(&dispatch_channel, &format!("⚠️ {e}"))
             .await;
+    } else if let (Ok(outcome), Some(completion)) = (&result, handoff_completion.as_ref()) {
+        let sanitized = sanitize_handoff_child_result(&outcome.final_content);
+        if let Err(e) = target
+            .summarize_handoff_completion(adapter, completion, &sanitized)
+            .await
+        {
+            warn!(
+                error = %e,
+                parent_session_key = %completion.parent_session_key,
+                "handoff parent summary reply failed"
+            );
+        }
     }
 
     let agent_dispatch_ms = dispatch_start.elapsed().as_millis();
@@ -854,6 +893,61 @@ async fn dispatch_batch(
 // ---------------------------------------------------------------------------
 // Token estimation
 // ---------------------------------------------------------------------------
+
+const HANDOFF_SUMMARY_INPUT_MAX_CHARS: usize = 12_000;
+
+fn sanitize_handoff_child_result(content: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && should_drop_handoff_summary_line(trimmed) {
+            continue;
+        }
+        out.push(raw_line.trim_end());
+    }
+
+    let sanitized = out.join("\n").trim().to_string();
+    truncate_chars_for_handoff_summary(&sanitized, HANDOFF_SUMMARY_INPUT_MAX_CHARS)
+}
+
+fn should_drop_handoff_summary_line(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("[[") && trimmed.contains("]]") {
+        return true;
+    }
+    if trimmed == "_(no response)_" {
+        return true;
+    }
+    if trimmed.starts_with("⚠️ _Session expired") {
+        return true;
+    }
+    if trimmed.starts_with("⏳ Thinking...")
+        || trimmed.starts_with("⏳ Waiting for agent output...")
+        || trimmed.starts_with("🔧 Running `")
+        || trimmed.starts_with("🔧 `")
+        || trimmed.starts_with("✅ `")
+        || trimmed.starts_with("❌ `")
+        || trimmed.contains(" tool(s)")
+        || trimmed.ends_with(" more running")
+    {
+        return true;
+    }
+    false
+}
+
+fn truncate_chars_for_handoff_summary(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    value.chars().take(max_chars).collect()
+}
 
 /// Rough char-to-token ratio for English-ish text. Coarse on purpose — the goal
 /// is a guard rail for `max_batch_tokens`, not an exact pre-flight.
@@ -1398,6 +1492,12 @@ mod tests {
         initial_reply_to: Option<String>,
     }
 
+    #[derive(Clone)]
+    struct RecordedSummary {
+        parent_session_key: String,
+        sanitized_child_result: String,
+    }
+
     /// Mock `DispatchTarget` — records calls; never touches a real session pool.
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
@@ -1406,6 +1506,9 @@ mod tests {
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
         stream_err: Mutex<Option<String>>,
+        stream_final_content: Mutex<String>,
+        summaries: Mutex<Vec<RecordedSummary>>,
+        summary_err: Mutex<Option<String>>,
     }
 
     impl MockDispatchTarget {
@@ -1415,11 +1518,18 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
+                stream_final_content: Mutex::new("child completed".into()),
+                summaries: Mutex::new(Vec::new()),
+                summary_err: Mutex::new(None),
             }
         }
 
         fn calls(&self) -> Vec<RecordedDispatch> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn summaries(&self) -> Vec<RecordedSummary> {
+            self.summaries.lock().unwrap().clone()
         }
     }
 
@@ -1464,7 +1574,7 @@ mod tests {
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
             initial_reply_to: Option<String>,
-        ) -> Result<()> {
+        ) -> Result<StreamPromptOutcome> {
             self.calls.lock().unwrap().push(RecordedDispatch {
                 session_key: session_key.to_string(),
                 block_count: content_blocks.len(),
@@ -1473,6 +1583,24 @@ mod tests {
                 initial_reply_to,
             });
             if let Some(msg) = self.stream_err.lock().unwrap().take() {
+                return Err(anyhow::anyhow!(msg));
+            }
+            Ok(StreamPromptOutcome {
+                final_content: self.stream_final_content.lock().unwrap().clone(),
+            })
+        }
+
+        async fn summarize_handoff_completion(
+            &self,
+            _adapter: &Arc<dyn ChatAdapter>,
+            completion: &HandoffCompletionNotification,
+            sanitized_child_result: &str,
+        ) -> Result<()> {
+            self.summaries.lock().unwrap().push(RecordedSummary {
+                parent_session_key: completion.parent_session_key.clone(),
+                sanitized_child_result: sanitized_child_result.to_string(),
+            });
+            if let Some(msg) = self.summary_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
             Ok(())
@@ -1547,6 +1675,27 @@ mod tests {
             recipient: None,
             initial_reply_to: None,
             session_key_override: None,
+            handoff_completion: None,
+        }
+    }
+
+    fn make_handoff_completion() -> HandoffCompletionNotification {
+        HandoffCompletionNotification {
+            parent_channel: ChannelRef {
+                platform: "mock".into(),
+                channel_id: "parent".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            parent_trigger_msg: MessageRef {
+                channel: make_channel("parent"),
+                message_id: "parent-msg".into(),
+            },
+            parent_session_key: "mock-inline:parent".into(),
+            original_prompt: "please do the task".into(),
+            child_display: "mock thread child".into(),
+            max_summary_chars: 120,
         }
     }
 
@@ -1655,6 +1804,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_completion_summarizes_initial_child_turn_once() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        *mock.stream_final_content.lock().unwrap() =
+            "✅ `cargo test`\n⏳ Thinking... 2s\nImplemented the fix and tests pass.".into();
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+
+        let mut msg = make_msg("child", 10);
+        msg.handoff_completion = Some(make_handoff_completion());
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let summaries = mock.summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].parent_session_key, "mock-inline:parent");
+        assert_eq!(
+            summaries[0].sanitized_child_result,
+            "Implemented the fix and tests pass."
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_thread_followup_does_not_trigger_handoff_summary() {
+        let calls = run_consumer_with_messages(vec![make_msg("followup", 10)], 10, 24_000).await;
+        assert_eq!(calls.len(), 1);
+
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        tx.send(make_msg("followup", 10)).await.unwrap();
+        drop(tx);
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(mock.summaries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_summary_failure_does_not_fail_child_dispatch() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        *mock.summary_err.lock().unwrap() = Some("summary failed".into());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+
+        let mut msg = make_msg("child", 10);
+        msg.handoff_completion = Some(make_handoff_completion());
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        assert_eq!(mock.calls().len(), 1);
+        assert_eq!(mock.summaries().len(), 1);
+    }
+
+    #[tokio::test]
     async fn consumer_dispatch_preserves_thread_route_while_refreshing_origin_event_id() {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
@@ -1735,6 +1973,36 @@ mod tests {
         // No dispatches should have been recorded.
         assert!(mock.calls().is_empty());
         drop(tx);
+    }
+
+    #[test]
+    fn sanitize_handoff_child_result_removes_tool_thinking_and_directives() {
+        let input = "[[reply_to:123]]\n\
+✅ `cargo test`\n\
+❌ `cargo clippy`\n\
+✅ 2 · 🔧 1 tool(s)\n\
+⏳ Thinking... 12s\n\
+🔧 Running `cargo test`... 3s\n\
+\n\
+Implemented the requested behavior.\n\
+```text\n\
+✅ `inside fence stays`\n\
+```";
+        let sanitized = sanitize_handoff_child_result(input);
+        assert!(!sanitized.contains("[[reply_to"));
+        assert!(!sanitized.contains("Thinking"));
+        assert!(!sanitized.contains("tool(s)"));
+        assert!(!sanitized.contains("Running `cargo"));
+        assert!(sanitized.contains("Implemented the requested behavior."));
+        assert!(sanitized.contains("✅ `inside fence stays`"));
+    }
+
+    #[test]
+    fn sanitize_handoff_child_result_can_return_empty() {
+        assert_eq!(
+            sanitize_handoff_child_result("[[reply_to:123]]\n_(no response)_\n⏳ Thinking... 1s"),
+            ""
+        );
     }
 
     #[tokio::test]

@@ -239,9 +239,17 @@ async fn main() -> anyhow::Result<()> {
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
     let handoff_broker = if cfg.context_mcp.handoff_enabled {
-        Some(Arc::new(handoff::HandoffBroker::new(
-            std::time::Duration::from_secs(cfg.context_mcp.handoff_token_ttl_secs),
-        )))
+        let ttl = std::time::Duration::from_secs(cfg.context_mcp.handoff_token_ttl_secs);
+        if cfg.context_mcp.handoff_parent_summary_enabled {
+            Some(Arc::new(handoff::HandoffBroker::with_completion_summary(
+                ttl,
+                Some(handoff::HandoffCompletionSummaryConfig {
+                    max_summary_chars: cfg.context_mcp.handoff_parent_summary_max_chars,
+                }),
+            )))
+        } else {
+            Some(Arc::new(handoff::HandoffBroker::new(ttl)))
+        }
     } else {
         None
     };

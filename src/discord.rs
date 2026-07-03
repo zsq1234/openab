@@ -1030,6 +1030,9 @@ impl EventHandler for Handler {
                             dispatcher: dispatcher.clone(),
                             parent_channel: thread_channel.clone(),
                             trigger_msg: trigger_msg.clone(),
+                            parent_session_key: session_key_override.clone().unwrap_or_else(|| {
+                                format!("discord:{}", thread_channel.channel_id)
+                            }),
                             sender_json: serde_json::to_string(&child_sender).unwrap(),
                             sender_name: sender.sender_name.clone(),
                             sender_id: sender.sender_id.clone(),
@@ -1065,6 +1068,7 @@ impl EventHandler for Handler {
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
                 initial_reply_to,
                 session_key_override,
+                handoff_completion: None,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -2261,6 +2265,7 @@ impl Handler {
                 recipient: None,
                 initial_reply_to,
                 session_key_override,
+                handoff_completion: None,
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)

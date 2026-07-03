@@ -537,6 +537,10 @@ impl ChatAdapter for SlackAdapter {
         self.assistant_mode
     }
 
+    fn uses_assistant_status_for(&self, channel: &ChannelRef) -> bool {
+        self.assistant_mode && slack_assistant_status_thread_ts(channel).is_some()
+    }
+
     fn uses_native_streaming(&self, other_bot_present: bool) -> bool {
         let native = self.assistant_mode && !other_bot_present;
         debug!(
@@ -667,8 +671,15 @@ impl ChatAdapter for SlackAdapter {
     }
 
     async fn set_status(&self, channel: &ChannelRef, status: &str) -> Result<()> {
-        let thread_ts = channel.thread_id.clone().unwrap_or_default();
-        let body = build_set_status_body(&channel.channel_id, &thread_ts, status);
+        let Some(thread_ts) = slack_assistant_status_thread_ts(channel) else {
+            debug!(
+                channel = %channel.channel_id,
+                status,
+                "skipping Slack assistant status without thread_ts"
+            );
+            return Ok(());
+        };
+        let body = build_set_status_body(&channel.channel_id, thread_ts, status);
         if let Err(e) = self.api_post("assistant.threads.setStatus", body).await {
             warn!(error = %e, status, "assistant.threads.setStatus failed (cosmetic)");
         }
@@ -1539,6 +1550,7 @@ async fn handle_message(
                     dispatcher: dispatcher.clone(),
                     parent_channel: thread_channel.clone(),
                     trigger_msg: trigger_msg.clone(),
+                    parent_session_key: format!("slack:{}", thread_channel.channel_id),
                     sender_json: serialize_slack_sender_context(&child_sender),
                     sender_name: sender.sender_name.clone(),
                     sender_id: sender.sender_id.clone(),
@@ -1583,6 +1595,7 @@ async fn handle_message(
         recipient: stream_recipient,
         initial_reply_to: None,
         session_key_override: None,
+        handoff_completion: None,
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)
@@ -1891,6 +1904,13 @@ fn build_set_status_body(channel_id: &str, thread_ts: &str, status: &str) -> ser
     })
 }
 
+fn slack_assistant_status_thread_ts(channel: &ChannelRef) -> Option<&str> {
+    if !channel.channel_id.starts_with('D') {
+        return None;
+    }
+    channel.thread_id.as_deref().filter(|ts| !ts.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1920,6 +1940,54 @@ mod tests {
         assert_eq!(b["channel_id"], "C1");
         assert_eq!(b["thread_ts"], "1700.1");
         assert_eq!(b["status"], "Thinking\u{2026}");
+    }
+
+    #[test]
+    fn assistant_status_requires_thread_ts() {
+        let inline_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "D1".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(slack_assistant_status_thread_ts(&inline_channel), None);
+
+        let empty_thread_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "D1".into(),
+            thread_id: Some("".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(
+            slack_assistant_status_thread_ts(&empty_thread_channel),
+            None
+        );
+
+        let normal_thread_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "C1".into(),
+            thread_id: Some("1700.1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(
+            slack_assistant_status_thread_ts(&normal_thread_channel),
+            None
+        );
+
+        let assistant_thread_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "D1".into(),
+            thread_id: Some("1700.1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(
+            slack_assistant_status_thread_ts(&assistant_thread_channel),
+            Some("1700.1")
+        );
     }
 
     #[test]
@@ -2289,6 +2357,28 @@ mod tests {
         assert!(
             adapter.uses_assistant_status(),
             "assistant_mode enables status API"
+        );
+        let normal_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "C1".into(),
+            thread_id: Some("1700.1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert!(
+            !adapter.uses_assistant_status_for(&normal_channel),
+            "normal channel threads cannot use assistant status"
+        );
+        let assistant_channel = ChannelRef {
+            platform: "slack".into(),
+            channel_id: "D1".into(),
+            thread_id: Some("1700.1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert!(
+            adapter.uses_assistant_status_for(&assistant_channel),
+            "DM assistant threads can use assistant status"
         );
         assert!(
             adapter.use_streaming(false),

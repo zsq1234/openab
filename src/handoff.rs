@@ -13,7 +13,23 @@ use tokio::time::Instant;
 #[derive(Clone)]
 pub struct HandoffBroker {
     ttl: Duration,
+    completion_summary: Option<HandoffCompletionSummaryConfig>,
     entries: Arc<Mutex<HashMap<String, HandoffEntry>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandoffCompletionSummaryConfig {
+    pub max_summary_chars: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct HandoffCompletionNotification {
+    pub parent_channel: ChannelRef,
+    pub parent_trigger_msg: MessageRef,
+    pub parent_session_key: String,
+    pub original_prompt: String,
+    pub child_display: String,
+    pub max_summary_chars: usize,
 }
 
 pub struct HandoffRegistration {
@@ -21,6 +37,7 @@ pub struct HandoffRegistration {
     pub dispatcher: Arc<Dispatcher>,
     pub parent_channel: ChannelRef,
     pub trigger_msg: MessageRef,
+    pub parent_session_key: String,
     pub sender_json: String,
     pub sender_name: String,
     pub sender_id: String,
@@ -34,6 +51,7 @@ struct HandoffEntry {
     dispatcher: Arc<Dispatcher>,
     parent_channel: ChannelRef,
     trigger_msg: MessageRef,
+    parent_session_key: String,
     sender_json: String,
     sender_name: String,
     sender_id: String,
@@ -54,8 +72,16 @@ pub struct HandoffStarted {
 
 impl HandoffBroker {
     pub fn new(ttl: Duration) -> Self {
+        Self::with_completion_summary(ttl, None)
+    }
+
+    pub fn with_completion_summary(
+        ttl: Duration,
+        completion_summary: Option<HandoffCompletionSummaryConfig>,
+    ) -> Self {
         Self {
             ttl,
+            completion_summary,
             entries: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -67,6 +93,7 @@ impl HandoffBroker {
             dispatcher: registration.dispatcher,
             parent_channel: registration.parent_channel,
             trigger_msg: registration.trigger_msg,
+            parent_session_key: registration.parent_session_key,
             sender_json: registration.sender_json,
             sender_name: registration.sender_name,
             sender_id: registration.sender_id,
@@ -124,6 +151,17 @@ impl HandoffBroker {
                 .dispatcher
                 .key(entry.adapter.platform(), &thread_id, &entry.sender_id);
         let estimated_tokens = estimate_tokens(&child_prompt, &entry.extra_blocks);
+        let handoff_completion =
+            self.completion_summary
+                .as_ref()
+                .map(|summary| HandoffCompletionNotification {
+                    parent_channel: entry.parent_channel.clone(),
+                    parent_trigger_msg: entry.trigger_msg.clone(),
+                    parent_session_key: entry.parent_session_key.clone(),
+                    original_prompt: entry.original_prompt.clone(),
+                    child_display: format_thread_display(&thread_channel),
+                    max_summary_chars: summary.max_summary_chars,
+                });
         let msg = BufferedMessage {
             sender_json: entry.sender_json,
             sender_name: entry.sender_name,
@@ -136,6 +174,7 @@ impl HandoffBroker {
             recipient: None,
             initial_reply_to: None,
             session_key_override: None,
+            handoff_completion,
         };
 
         entry
@@ -267,6 +306,7 @@ mod tests {
     struct TestTarget {
         reactions: crate::config::ReactionsConfig,
         captured: Arc<Mutex<Vec<CapturedDispatch>>>,
+        summaries: Arc<Mutex<Vec<HandoffCompletionNotification>>>,
     }
 
     #[async_trait]
@@ -307,12 +347,24 @@ mod tests {
             _other_bot_present: bool,
             _recipient: Option<(String, String)>,
             _initial_reply_to: Option<String>,
-        ) -> Result<()> {
+        ) -> Result<crate::adapter::StreamPromptOutcome> {
             self.captured.lock().await.push(CapturedDispatch {
                 session_key: session_key.to_string(),
                 content_blocks,
                 thread_channel: thread_channel.clone(),
             });
+            Ok(crate::adapter::StreamPromptOutcome {
+                final_content: "done".into(),
+            })
+        }
+
+        async fn summarize_handoff_completion(
+            &self,
+            _adapter: &Arc<dyn ChatAdapter>,
+            completion: &HandoffCompletionNotification,
+            _sanitized_child_result: &str,
+        ) -> Result<()> {
+            self.summaries.lock().await.push(completion.clone());
             Ok(())
         }
     }
@@ -355,6 +407,7 @@ mod tests {
                 },
                 message_id: "msg".into(),
             },
+            parent_session_key: "discord-inline:parent".into(),
             sender_json: "{}".into(),
             sender_name: "alice".into(),
             sender_id: "u1".into(),
@@ -448,6 +501,46 @@ mod tests {
         assert!(text.contains("<openab_handoff_context>"));
         assert!(text.contains("original_message:\noriginal"));
         assert!(text.contains("child task prompt"));
+    }
+
+    #[tokio::test]
+    async fn completion_metadata_only_attached_when_configured() {
+        let target_without = Arc::new(TestTarget::default());
+        let broker_without = HandoffBroker::new(Duration::from_secs(60));
+        let adapter = mock_adapter("discord");
+        let token = broker_without
+            .register(registration(
+                adapter.clone(),
+                test_dispatcher(target_without.clone()),
+            ))
+            .await;
+        broker_without
+            .start_thread_task(&token, "title", "child task")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(target_without.summaries.lock().await.is_empty());
+
+        let target_with = Arc::new(TestTarget::default());
+        let broker_with = HandoffBroker::with_completion_summary(
+            Duration::from_secs(60),
+            Some(HandoffCompletionSummaryConfig {
+                max_summary_chars: 123,
+            }),
+        );
+        let token = broker_with
+            .register(registration(adapter, test_dispatcher(target_with.clone())))
+            .await;
+        broker_with
+            .start_thread_task(&token, "title", "child task")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let summaries = target_with.summaries.lock().await;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].parent_session_key, "discord-inline:parent");
+        assert_eq!(summaries[0].max_summary_chars, 123);
     }
 
     #[tokio::test]

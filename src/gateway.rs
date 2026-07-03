@@ -899,6 +899,7 @@ pub async fn run_gateway_adapter(
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                             initial_reply_to: None,
                                             session_key_override: None,
+                                            handoff_completion: None,
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)

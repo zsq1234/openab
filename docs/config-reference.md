@@ -68,7 +68,7 @@ Slack adapter using Socket Mode. Requires both a Bot User OAuth Token and an App
 | `normal_channel_reply_mode` | string | `"thread"` | Normal-channel `@bot` behavior: `"thread"` replies in a Slack thread rooted at the triggering message; `"inline"` replies as a top-level message in the current channel. Existing Slack threads are unchanged. |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |
-| `assistant_mode` | bool | `true` | Use `assistant.threads.setStatus` for status indicators instead of emoji reactions, and native content streaming via `chat.startStream`/`appendStream`/`stopStream` instead of the post+edit loop. Native streaming is suppressed when another bot is present in the thread. Requires an AI-app Slack app with `assistant:write` — set to `false` for non-AI Slack apps to keep emoji-reaction status. When native streaming is active, the `reply_to` output directive is bypassed — the streamed message is itself the in-thread reply. |
+| `assistant_mode` | bool | `true` | Use Slack AI-app APIs where supported: `assistant.threads.setStatus` for status indicators in Slack Assistant DM/app threads, and native content streaming via `chat.startStream`/`appendStream`/`stopStream` instead of the post+edit loop. Normal channels and ordinary Slack threads keep emoji-reaction status because Slack assistant thread status is not valid there. Native streaming is suppressed when another bot is present in the thread. Requires an AI-app Slack app with `assistant:write` — set to `false` for non-AI Slack apps. When native streaming is active, the `reply_to` output directive is bypassed — the streamed message is itself the in-thread reply. |
 
 ---
 
@@ -90,6 +90,8 @@ allowed_platforms = ["discord", "slack"]
 allow_normal_channels = false
 handoff_enabled = false
 handoff_token_ttl_secs = 300
+handoff_parent_summary_enabled = false
+handoff_parent_summary_max_chars = 400
 inject_into_agent = false
 agent_url = "http://openab-context-mcp:18080/mcp"
 agent_server_name = "openab_context"
@@ -108,6 +110,8 @@ agent_allowed_tools = ["read_current_thread", "read_message", "handoff_to_thread
 | `allow_normal_channels` | bool | `false` | Allows `read_current_thread` to read Discord or Slack normal channel history when the requested channel is allowed by OpenAB configuration. Keep disabled unless the agent needs channel-level context. |
 | `handoff_enabled` | bool | `false` | Enables `handoff_to_thread`, an MCP action tool that lets an inline normal-channel agent start a thread-backed child task under the original user message. Requires `enabled = true`. |
 | `handoff_token_ttl_secs` | u64 | `300` | Lifetime for each single-use handoff token exposed in `<sender_context>`. |
+| `handoff_parent_summary_enabled` | bool | `false` | When true, the initial handoff child thread turn is summarized by the original normal-channel agent/session and sent as a concise reply to the original normal-channel message. Requires `handoff_enabled = true`. |
+| `handoff_parent_summary_max_chars` | usize | `400` | Target maximum characters requested in the parent-agent summary prompt. OpenAB does not hard-truncate the summary before sending, so URLs are not cut by the broker. Must be positive. |
 | `inject_into_agent` | bool | `false` | Adds this OpenAB MCP server to ACP `session/new` and `session/load` `mcpServers` payloads. Requires `agent_url`. |
 | `agent_url` | string | — | Agent-reachable URL for this MCP endpoint, for example a Kubernetes Service URL. Required when `inject_into_agent = true`. |
 | `agent_server_name` | string | `"openab_context"` | Name used for the injected MCP server. |
