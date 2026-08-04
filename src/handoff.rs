@@ -327,6 +327,7 @@ mod tests {
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
+            _session_context: Option<&crate::acp::AcpSessionContext>,
         ) -> Result<bool> {
             Ok(true)
         }

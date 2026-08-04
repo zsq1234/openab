@@ -2,6 +2,7 @@ use crate::acp::connection::{AcpConnection, AcpWriter};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +43,37 @@ pub struct SessionPool {
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpSessionChannelKind {
+    Normal,
+    Thread,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpSessionContext {
+    pub platform: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub channel_kind: AcpSessionChannelKind,
+}
+
+impl AcpSessionContext {
+    pub fn to_json(&self) -> Value {
+        let channel_kind = match self.channel_kind {
+            AcpSessionChannelKind::Normal => "normal",
+            AcpSessionChannelKind::Thread => "thread",
+        };
+        json!({
+            "platform": self.platform,
+            "channelId": self.channel_id,
+            "threadId": self.thread_id,
+            "parentId": self.parent_id,
+            "channelKind": channel_kind,
+        })
+    }
+}
 
 fn remove_if_same_handle<T>(
     map: &mut HashMap<String, Arc<Mutex<T>>>,
@@ -186,6 +218,7 @@ impl SessionPool {
         &self,
         thread_id: &str,
         working_dir_override: Option<&str>,
+        session_context: Option<&AcpSessionContext>,
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -267,6 +300,11 @@ impl SessionPool {
             AcpConnection::spawn(&self.config, &effective_workdir, thread_id).await?;
 
         new_conn.initialize().await?;
+        if self.config.include_session_context {
+            if let Some(context) = session_context {
+                new_conn.set_session_context(context.to_json());
+            }
+        }
 
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
@@ -722,6 +760,8 @@ mod tests {
                 env: HashMap::new(),
                 inherit_env: vec![],
                 mcp_servers: vec![],
+                session_params: HashMap::new(),
+                include_session_context: false,
                 command_explicit: true,
             },
             1,
@@ -748,6 +788,8 @@ mod tests {
                 env: HashMap::new(),
                 inherit_env: vec![],
                 mcp_servers: vec![],
+                session_params: HashMap::new(),
+                include_session_context: false,
                 command_explicit: true,
             },
             1,
@@ -776,6 +818,8 @@ mod tests {
                 env: HashMap::new(),
                 inherit_env: vec![],
                 mcp_servers: vec![],
+                session_params: HashMap::new(),
+                include_session_context: false,
                 command_explicit: true,
             },
             1,
@@ -802,6 +846,8 @@ mod tests {
                 env: HashMap::new(),
                 inherit_env: vec![],
                 mcp_servers: vec![],
+                session_params: HashMap::new(),
+                include_session_context: false,
                 command_explicit: false,
             },
             1,
@@ -830,6 +876,8 @@ mod tests {
                 env: HashMap::new(),
                 inherit_env: vec![],
                 mcp_servers: vec![],
+                session_params: HashMap::new(),
+                include_session_context: false,
                 command_explicit: false,
             },
             1,

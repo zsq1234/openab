@@ -66,6 +66,7 @@ args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 # per_session_working_dir = true       # false (default) = one shared cwd
 #                                      # true = create working_dir/<platform>_<thread-or-channel-id>
+# include_session_context = true       # add openabSession.channelKind to ACP session params
 
 # [agent]
 # command = "claude-agent-acp"
@@ -86,6 +87,12 @@ working_dir = "/home/agent"
 # To pass additional env vars from the OAB process (e.g. vars injected via K8s envFrom),
 # list them in inherit_env. Keys in [agent].env take precedence over inherited ones.
 # inherit_env = ["API_BASE_URL", "MODEL_NAME"]
+#
+# Extra ACP fields to include in session/new and session/load params.
+# Reserved fields are managed by OpenAB and cannot be set here:
+# cwd, sessionId, mcpServers, openabSession.
+# [agent.session_params]
+# permissionMode = "acceptEdits"
 
 # [agent]
 # command = "codex"
