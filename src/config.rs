@@ -1,6 +1,7 @@
 use crate::markdown::TableMode;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -696,6 +697,8 @@ struct AgentConfigRaw {
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
     mcp_servers: Vec<AgentMcpServerConfig>,
+    session_params: HashMap<String, Value>,
+    include_session_context: bool,
 }
 
 impl Default for AgentConfigRaw {
@@ -711,6 +714,8 @@ impl Default for AgentConfigRaw {
             env: HashMap::new(),
             inherit_env: Vec::new(),
             mcp_servers: Vec::new(),
+            session_params: HashMap::new(),
+            include_session_context: false,
         }
     }
 }
@@ -727,6 +732,11 @@ pub struct AgentConfig {
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
     pub mcp_servers: Vec<AgentMcpServerConfig>,
+    /// Extra JSON fields merged into ACP session/new and session/load params.
+    /// Core fields (cwd, sessionId, mcpServers) are reserved and cannot be set here.
+    pub session_params: HashMap<String, Value>,
+    /// Include OpenAB routing metadata in ACP session/new and session/load params.
+    pub include_session_context: bool,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -744,6 +754,8 @@ impl Default for AgentConfig {
             env: HashMap::new(),
             inherit_env: Vec::new(),
             mcp_servers: Vec::new(),
+            session_params: HashMap::new(),
+            include_session_context: false,
             command_explicit: false,
         }
     }
@@ -775,6 +787,8 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             env: raw.env,
             inherit_env: raw.inherit_env,
             mcp_servers: raw.mcp_servers,
+            session_params: raw.session_params,
+            include_session_context: raw.include_session_context,
             command_explicit: cmd_explicit,
         })
     }
@@ -1294,6 +1308,8 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
                 mcp_servers: config.agent.mcp_servers.clone(),
+                session_params: config.agent.session_params.clone(),
+                include_session_context: config.agent.include_session_context,
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -1420,6 +1436,16 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         );
     }
 
+    for key in config.agent.session_params.keys() {
+        anyhow::ensure!(
+            !matches!(
+                key.as_str(),
+                "cwd" | "sessionId" | "mcpServers" | "openabSession"
+            ),
+            "agent.session_params.{key} is reserved; configure working_dir or agent.mcp_servers instead"
+        );
+    }
+
     if config.context_mcp.inject_into_agent {
         inject_context_mcp_server(&mut config);
     }
@@ -1532,6 +1558,60 @@ per_session_working_dir = true
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.agent.per_session_working_dir);
+    }
+
+    #[test]
+    fn parse_agent_session_params() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[agent.session_params]
+permissionMode = "acceptEdits"
+maxTurns = 3
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(
+            cfg.agent.session_params.get("permissionMode"),
+            Some(&serde_json::json!("acceptEdits"))
+        );
+        assert_eq!(
+            cfg.agent.session_params.get("maxTurns"),
+            Some(&serde_json::json!(3))
+        );
+    }
+
+    #[test]
+    fn parse_agent_include_session_context() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+include_session_context = true
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert!(cfg.agent.include_session_context);
+    }
+
+    #[test]
+    fn reject_reserved_agent_session_params() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[agent]
+command = "echo"
+
+[agent.session_params]
+cwd = "/tmp/other"
+"#;
+        let err = parse_config(toml, "test").unwrap_err().to_string();
+        assert!(err.contains("agent.session_params.cwd is reserved"));
     }
 
     #[test]

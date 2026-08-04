@@ -547,7 +547,7 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
+        if let Err(e) = self.pool.get_or_create(&thread_key, None, None).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
@@ -681,7 +681,7 @@ impl AdapterRouter {
     }
 
     async fn run_internal_text_prompt(&self, session_key: &str, prompt: String) -> Result<String> {
-        self.pool.get_or_create(session_key, None).await?;
+        self.pool.get_or_create(session_key, None, None).await?;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
         self.pool

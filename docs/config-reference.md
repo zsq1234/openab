@@ -202,8 +202,26 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `per_session_working_dir` | bool | `false` | When `true`, OpenAB creates a stable per-session subdirectory under `working_dir` and uses that as the agent cwd. Discord threads become paths like `working_dir/discord_<thread_id>`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `include_session_context` | bool | `false` | When `true`, include `openabSession` metadata in `session/new` and `session/load` params so agents can distinguish normal-channel inline sessions from thread sessions. |
+| `session_params` | table | `{}` | Extra ACP fields merged into `session/new` and `session/load` params. Reserved fields `cwd`, `sessionId`, `mcpServers`, and `openabSession` are managed by OpenAB and cannot be set here. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
+
+With `include_session_context = true`, OpenAB adds:
+
+```json
+{
+  "openabSession": {
+    "platform": "discord",
+    "channelId": "123",
+    "threadId": null,
+    "parentId": null,
+    "channelKind": "normal"
+  }
+}
+```
+
+`channelKind` is `"normal"` for inline normal-channel sessions and `"thread"` for Discord thread channels or Slack thread sessions.
 
 ## S3 Discarded File Offload
 

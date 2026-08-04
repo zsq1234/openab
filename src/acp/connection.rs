@@ -4,6 +4,7 @@ use crate::acp::protocol::{
 use crate::config::{AgentConfig, AgentMcpServerConfig, AgentTransport};
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Map;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,6 +164,8 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub session_reset: bool,
     mcp_servers: Value,
+    session_params: Map<String, Value>,
+    session_context: Option<Value>,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
 }
@@ -217,6 +220,25 @@ fn mcp_servers_json(servers: &[AgentMcpServerConfig]) -> Value {
         items.push(Value::Object(cfg));
     }
     Value::Array(items)
+}
+
+fn build_session_params(
+    extra: &Map<String, Value>,
+    session_context: Option<&Value>,
+    cwd: &str,
+    session_id: Option<&str>,
+    mcp_servers: &Value,
+) -> Value {
+    let mut params = extra.clone();
+    if let Some(session_context) = session_context {
+        params.insert("openabSession".into(), session_context.clone());
+    }
+    params.insert("cwd".into(), Value::String(cwd.to_string()));
+    params.insert("mcpServers".into(), mcp_servers.clone());
+    if let Some(session_id) = session_id {
+        params.insert("sessionId".into(), Value::String(session_id.to_string()));
+    }
+    Value::Object(params)
 }
 
 async fn finish_reader_loop(
@@ -469,6 +491,11 @@ async fn run_ws_reader_loop(
 impl AcpConnection {
     pub async fn spawn(config: &AgentConfig, working_dir: &str, thread_key: &str) -> Result<Self> {
         let mcp_servers = mcp_servers_json(&config.mcp_servers);
+        let session_params = config
+            .session_params
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Map<String, Value>>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
@@ -629,6 +656,8 @@ impl AcpConnection {
                     last_active: Instant::now(),
                     session_reset: false,
                     mcp_servers,
+                    session_params: session_params.clone(),
+                    session_context: None,
                     _reader_handle: reader_handle,
                     _stderr_handle: stderr_handle,
                 })
@@ -681,6 +710,8 @@ impl AcpConnection {
                     last_active: Instant::now(),
                     session_reset: false,
                     mcp_servers,
+                    session_params,
+                    session_context: None,
                     _reader_handle: reader_handle,
                     _stderr_handle: None,
                 })
@@ -690,6 +721,10 @@ impl AcpConnection {
 
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn set_session_context(&mut self, context: Value) {
+        self.session_context = Some(context);
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
@@ -754,7 +789,13 @@ impl AcpConnection {
         let resp = self
             .send_request(
                 "session/new",
-                Some(json!({"cwd": cwd, "mcpServers": self.mcp_servers.clone()})),
+                Some(build_session_params(
+                    &self.session_params,
+                    self.session_context.as_ref(),
+                    cwd,
+                    None,
+                    &self.mcp_servers,
+                )),
             )
             .await?;
 
@@ -924,11 +965,13 @@ impl AcpConnection {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({
-                    "sessionId": session_id,
-                    "cwd": cwd,
-                    "mcpServers": self.mcp_servers.clone(),
-                })),
+                Some(build_session_params(
+                    &self.session_params,
+                    self.session_context.as_ref(),
+                    cwd,
+                    Some(session_id),
+                    &self.mcp_servers,
+                )),
             )
             .await?;
         // Accept any non-error response as success
@@ -984,7 +1027,10 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, mcp_servers_json, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, build_session_params, mcp_servers_json,
+        pick_best_option,
+    };
     use crate::config::AgentMcpServerConfig;
     use serde_json::json;
 
@@ -1150,6 +1196,56 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn build_session_params_merges_extra_fields() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("permissionMode".into(), json!("acceptEdits"));
+        extra.insert("maxTurns".into(), json!(3));
+
+        let params = build_session_params(&extra, None, "/work", Some("sess-1"), &json!([]));
+
+        assert_eq!(
+            params,
+            json!({
+                "cwd": "/work",
+                "sessionId": "sess-1",
+                "mcpServers": [],
+                "permissionMode": "acceptEdits",
+                "maxTurns": 3
+            })
+        );
+    }
+
+    #[test]
+    fn build_session_params_core_fields_take_precedence() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("cwd".into(), json!("/wrong"));
+        extra.insert("sessionId".into(), json!("wrong"));
+        extra.insert("mcpServers".into(), json!({"wrong": true}));
+
+        let params = build_session_params(&extra, None, "/work", Some("sess-1"), &json!([]));
+
+        assert_eq!(params["cwd"], json!("/work"));
+        assert_eq!(params["sessionId"], json!("sess-1"));
+        assert_eq!(params["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn build_session_params_includes_openab_session_context() {
+        let extra = serde_json::Map::new();
+        let context = json!({
+            "platform": "discord",
+            "channelId": "123",
+            "threadId": null,
+            "parentId": null,
+            "channelKind": "normal"
+        });
+
+        let params = build_session_params(&extra, Some(&context), "/work", None, &json!([]));
+
+        assert_eq!(params["openabSession"], context);
     }
 }
 

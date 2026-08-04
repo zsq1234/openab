@@ -17,7 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::acp::ContentBlock;
+use crate::acp::{AcpSessionChannelKind, AcpSessionContext, ContentBlock};
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, StreamPromptOutcome};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
@@ -141,7 +141,12 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        session_context: Option<&AcpSessionContext>,
+    ) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
@@ -185,8 +190,15 @@ impl DispatchTarget for AdapterRouter {
         self.bot_home_path()
     }
 
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
-        self.pool().get_or_create(session_key, working_dir).await
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        session_context: Option<&AcpSessionContext>,
+    ) -> Result<bool> {
+        self.pool()
+            .get_or_create(session_key, working_dir, session_context)
+            .await
     }
 
     async fn reset_session(&self, session_key: &str) {
@@ -355,6 +367,23 @@ impl Dispatcher {
             .as_deref()
             .unwrap_or(&thread_channel.channel_id);
         format!("{}:{}", thread_channel.platform, logical_thread_id)
+    }
+
+    fn session_context(thread_channel: &ChannelRef) -> AcpSessionContext {
+        let channel_kind =
+            if thread_channel.parent_id.is_some() || thread_channel.thread_id.is_some() {
+                AcpSessionChannelKind::Thread
+            } else {
+                AcpSessionChannelKind::Normal
+            };
+
+        AcpSessionContext {
+            platform: thread_channel.platform.clone(),
+            channel_id: thread_channel.channel_id.clone(),
+            thread_id: thread_channel.thread_id.clone(),
+            parent_id: thread_channel.parent_id.clone(),
+            channel_kind,
+        }
     }
 
     /// Submit one arrival event for the given thread.
@@ -742,11 +771,16 @@ async fn dispatch_batch(
     // Extract workspace path for ensure_session (None if no directive or resolution failed).
     let workspace_override: Option<String> =
         ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
+    let session_context = Dispatcher::session_context(&dispatch_channel);
 
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
     let created_now = match target
-        .ensure_session(&session_key, workspace_override.as_deref())
+        .ensure_session(
+            &session_key,
+            workspace_override.as_deref(),
+            Some(&session_context),
+        )
         .await
     {
         Ok(created) => created,
@@ -1319,6 +1353,8 @@ mod tests {
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
             mcp_servers: vec![],
+            session_params: std::collections::HashMap::new(),
+            include_session_context: false,
             command_explicit: true,
         };
         let pool = Arc::new(SessionPool::new(agent_cfg, 1));
@@ -1551,6 +1587,7 @@ mod tests {
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
+            _session_context: Option<&AcpSessionContext>,
         ) -> Result<bool> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
