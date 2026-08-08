@@ -17,7 +17,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
-use crate::acp::{AcpSessionChannelKind, AcpSessionContext, ContentBlock};
+use crate::acp::{AcpSessionChannelKind, AcpSessionContext, ContentBlock, WorkspaceAccessOutcome};
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, StreamPromptOutcome};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
@@ -36,6 +36,8 @@ pub struct BufferedMessage {
     /// fields (per-event tracing in `dispatch_batch`) don't pay a JSON parse.
     /// Per ADR §2.3 each arrival event carries its sender name.
     pub sender_name: String,
+    /// Stable platform sender ID used for per-user ACP session authentication.
+    pub sender_id: String,
     /// User-visible prompt text (verbatim, never transformed).
     pub prompt: String,
     /// Attachment blocks (images, STT transcripts) in arrival order.
@@ -139,6 +141,12 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Bot home directory (security boundary for workspace resolution).
     fn bot_home(&self) -> std::path::PathBuf;
 
+    async fn provision_workspace_sender(
+        &self,
+        discord_user_id: &str,
+        discord_root_channel_id: &str,
+    ) -> Result<WorkspaceAccessOutcome>;
+
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
     async fn ensure_session(
@@ -188,6 +196,16 @@ impl DispatchTarget for AdapterRouter {
 
     fn bot_home(&self) -> std::path::PathBuf {
         self.bot_home_path()
+    }
+
+    async fn provision_workspace_sender(
+        &self,
+        discord_user_id: &str,
+        discord_root_channel_id: &str,
+    ) -> Result<WorkspaceAccessOutcome> {
+        self.pool()
+            .provision_workspace_editor(discord_user_id, discord_root_channel_id)
+            .await
     }
 
     async fn ensure_session(
@@ -369,7 +387,7 @@ impl Dispatcher {
         format!("{}:{}", thread_channel.platform, logical_thread_id)
     }
 
-    fn session_context(thread_channel: &ChannelRef) -> AcpSessionContext {
+    fn session_context(thread_channel: &ChannelRef, sender_id: &str) -> AcpSessionContext {
         let channel_kind =
             if thread_channel.parent_id.is_some() || thread_channel.thread_id.is_some() {
                 AcpSessionChannelKind::Thread
@@ -383,6 +401,7 @@ impl Dispatcher {
             thread_id: thread_channel.thread_id.clone(),
             parent_id: thread_channel.parent_id.clone(),
             channel_kind,
+            discord_user_id: (thread_channel.platform == "discord").then(|| sender_id.to_string()),
         }
     }
 
@@ -688,6 +707,36 @@ async fn consumer_loop(
 // dispatch_batch
 // ---------------------------------------------------------------------------
 
+fn inject_sender_space_id(sender_json: &mut String, space_id: &str) -> Result<()> {
+    let mut context: serde_json::Value = serde_json::from_str(sender_json)?;
+    let object = context
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("sender context must be a JSON object"))?;
+    object.insert(
+        "space_id".into(),
+        serde_json::Value::String(space_id.to_string()),
+    );
+    *sender_json = serde_json::to_string(&context)?;
+    Ok(())
+}
+
+async fn clear_queued_reactions(
+    target: &Arc<dyn DispatchTarget>,
+    adapter: &Arc<dyn ChatAdapter>,
+    batch: &[BufferedMessage],
+    assistant_status: bool,
+) {
+    if assistant_status {
+        return;
+    }
+    let queued_emoji = &target.reactions_config().emojis.queued;
+    for msg in batch {
+        let _ = adapter
+            .remove_reaction(&msg.trigger_msg, queued_emoji)
+            .await;
+    }
+}
+
 async fn dispatch_batch(
     thread_key: &str,
     thread_channel: &ChannelRef,
@@ -696,6 +745,7 @@ async fn dispatch_batch(
     batch: Vec<BufferedMessage>,
     other_bot_present: bool,
 ) {
+    let mut batch = batch;
     let dispatch_start = Instant::now();
     let batch_size = batch.len();
     let session_key = batch
@@ -739,6 +789,75 @@ async fn dispatch_batch(
         ..thread_channel.clone()
     };
 
+    if dispatch_channel.platform == "discord" {
+        let root_channel_id = dispatch_channel
+            .parent_id
+            .as_deref()
+            .unwrap_or(&dispatch_channel.channel_id);
+        let mut resolved_users: HashMap<String, Option<String>> = HashMap::new();
+        for index in 0..batch.len() {
+            let sender_id = batch[index].sender_id.clone();
+            let space_id = if let Some(space_id) = resolved_users.get(&sender_id) {
+                space_id.clone()
+            } else {
+                let resolved = match target
+                    .provision_workspace_sender(&sender_id, root_channel_id)
+                    .await
+                {
+                    Ok(WorkspaceAccessOutcome::NotConfigured) => {
+                        warn!(
+                            discord_user_id = sender_id,
+                            discord_root_channel_id = root_channel_id,
+                            "allowing Discord message without space_id because Workspace integration is not configured"
+                        );
+                        None
+                    }
+                    Ok(WorkspaceAccessOutcome::Granted(space_id)) => {
+                        debug!(
+                            discord_user_id = sender_id,
+                            discord_root_channel_id = root_channel_id,
+                            space_id,
+                            "Workspace access provisioned for sender context"
+                        );
+                        Some(space_id)
+                    }
+                    Ok(WorkspaceAccessOutcome::Unmapped) => {
+                        clear_queued_reactions(target, adapter, &batch, assistant_status).await;
+                        warn!(
+                            discord_user_id = sender_id,
+                            channel_id = %root_channel_id,
+                            "discarding message because no Workspace Space mapping was found"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        clear_queued_reactions(target, adapter, &batch, assistant_status).await;
+                        let user_msg = format_user_error(&e.to_string());
+                        let _ = adapter
+                            .send_message(&dispatch_channel, &format!("⚠️ {user_msg}"))
+                            .await;
+                        error!(error = %e, "Workspace sender provisioning failed");
+                        return;
+                    }
+                };
+                resolved_users.insert(sender_id, resolved.clone());
+                resolved
+            };
+
+            if let Some(space_id) = space_id {
+                if let Err(e) = inject_sender_space_id(&mut batch[index].sender_json, &space_id) {
+                    clear_queued_reactions(target, adapter, &batch, assistant_status).await;
+                    error!(error = %e, "failed to inject Workspace Space ID into sender context");
+                    return;
+                }
+                debug!(
+                    discord_user_id = batch[index].sender_id,
+                    space_id, "injected space_id into sender context"
+                );
+            }
+        }
+    }
+
     // Pack all arrival events into one Vec<ContentBlock> (§3.3).
     // Uses into_iter() to avoid deep-copying extra_blocks (may contain base64 image data).
     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -752,7 +871,6 @@ async fn dispatch_batch(
     //   3. Call ensure_session with resolved workspace — returns created_now
     //   4. Only strip prompt and apply title/workspace if created_now == true
     //   5. If created_now == false, the [[...]] text is preserved verbatim
-    let mut batch = batch;
     let parse_result = batch
         .first()
         .map(|first_msg| crate::directives::parse_directives(&first_msg.prompt));
@@ -771,7 +889,10 @@ async fn dispatch_batch(
     // Extract workspace path for ensure_session (None if no directive or resolution failed).
     let workspace_override: Option<String> =
         ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
-    let session_context = Dispatcher::session_context(&dispatch_channel);
+    let session_context = Dispatcher::session_context(
+        &dispatch_channel,
+        &batch.last().expect("dispatch batch is non-empty").sender_id,
+    );
 
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
@@ -1052,6 +1173,15 @@ mod tests {
         } else {
             panic!("expected Text prompt block");
         }
+    }
+
+    #[test]
+    fn sender_context_includes_workspace_space_id() {
+        let mut sender_json = r#"{"schema":"openab.sender.v1","sender_id":"u1"}"#.to_string();
+        inject_sender_space_id(&mut sender_json, "space-1").unwrap();
+        let value: serde_json::Value = serde_json::from_str(&sender_json).unwrap();
+        assert_eq!(value["space_id"], "space-1");
+        assert!(value.get("cookie").is_none());
     }
 
     #[test]
@@ -1540,6 +1670,7 @@ mod tests {
         calls: Mutex<Vec<RecordedDispatch>>,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
+        workspace_outcome: Mutex<WorkspaceAccessOutcome>,
         /// If set, `stream_prompt_blocks` returns this error once.
         stream_err: Mutex<Option<String>>,
         stream_final_content: Mutex<String>,
@@ -1553,6 +1684,7 @@ mod tests {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
+                workspace_outcome: Mutex::new(WorkspaceAccessOutcome::NotConfigured),
                 stream_err: Mutex::new(None),
                 stream_final_content: Mutex::new("child completed".into()),
                 summaries: Mutex::new(Vec::new()),
@@ -1581,6 +1713,14 @@ mod tests {
 
         fn bot_home(&self) -> std::path::PathBuf {
             std::path::PathBuf::from("/tmp")
+        }
+
+        async fn provision_workspace_sender(
+            &self,
+            _discord_user_id: &str,
+            _discord_root_channel_id: &str,
+        ) -> Result<WorkspaceAccessOutcome> {
+            Ok(self.workspace_outcome.lock().unwrap().clone())
         }
 
         async fn ensure_session(
@@ -1700,6 +1840,7 @@ mod tests {
             sender_json: r#"{"schema":"openab.sender.v1","sender_id":"u","sender_name":"u"}"#
                 .into(),
             sender_name: "u".into(),
+            sender_id: "u".into(),
             prompt: prompt.into(),
             extra_blocks: vec![],
             trigger_msg: MessageRef {
@@ -1774,6 +1915,28 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn unmapped_workspace_discards_message_before_acp_prompt() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        *mock.workspace_outcome.lock().unwrap() = WorkspaceAccessOutcome::Unmapped;
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let mut channel = make_channel("T");
+        channel.platform = "discord".into();
+
+        dispatch_batch(
+            "mock:T",
+            &channel,
+            &target,
+            &adapter,
+            vec![make_msg("unmapped", 10)],
+            false,
+        )
+        .await;
+
+        assert!(mock.calls().is_empty());
     }
 
     #[tokio::test]

@@ -1,26 +1,25 @@
 # Slash Commands
 
-OpenAB registers Discord slash commands for session control. These work in both guild threads and DMs.
+OpenAB currently exposes four Discord slash commands.
 
 ## Commands
 
 | Command | Description | Requires active session? |
 |---------|-------------|--------------------------|
-| `/models` | Select the AI model via dropdown menu | Yes |
-| `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
-| `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
-| `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
-| `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
+| `/join` | Log in to Univer Workspace and join the current channel's mapped Space as an editor | No |
+| `/bind` | Bind the current root channel to a Workspace Space (server owner only) | No |
+| `/init` | Create and bind a same-name Workspace Space for the current root channel (server owner or channel creator) | No |
 
 All responses are **ephemeral** — only the user who invoked the command sees the reply.
+Implementations for the other historical commands remain in the codebase but
+are not registered with Discord, so users do not see them in the command picker.
 
 ## Platform Support
 
 | Platform | Supported | Notes |
 |----------|-----------|-------|
-| Discord (guild threads) | ✅ | Commands registered per-guild for instant availability |
-| Discord (DMs) | ✅ | Commands registered globally; may take up to 1 hour to appear after first deploy |
+| Discord | ✅ | Commands are registered globally and may take time to propagate after deployment |
 | Slack | ❌ | Native Slack slash commands are not supported in threads. Send `/cancel` as a normal thread message to cancel an in-flight turn; see [slack.md](slack.md#native-slash-commands-are-not-supported-on-slack) |
 
 ## How They Work
@@ -67,6 +66,34 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
+
+### `/join`
+
+In a Discord root channel previously bound with `/bind`, `/join` logs in the
+invoking Discord user through Workspace and grants that Workspace user the
+`editor` role in the mapped Team Space. The response is ephemeral. If Workspace
+integration is not configured or the current channel ID has no mapping, no
+Workspace login or membership request is made.
+
+### `/bind`
+
+`/bind space_id:<id>` binds the current Discord root channel to a Workspace
+Team Space. Only the Discord server owner can use it, and it is rejected in
+threads and DMs. Bindings take effect immediately and persist in
+`$HOME/.openab/channel_space.json` across OpenAB restarts.
+
+### `/init`
+
+`/init` is restricted to the Discord server owner or root channel creator and
+can only be used in root channels. OpenAB verifies channel creators from
+Discord's `Channel Create` audit entries, which requires the bot's **View Audit
+Log** permission. Because Discord retains audit entries for 45 days, the server
+owner must initialize an older channel if its create entry has expired. If the
+channel is unbound, OpenAB uses the configured bot cookie to call
+`POST /api/team-spaces` with the Discord channel name, then persists the
+returned Space ID as the channel binding. The request sets `publicRead: true`,
+allowing signed-in users to read the Space without membership. If a binding
+already exists, no API request or file update is performed.
 
 ### `/export-thread`
 

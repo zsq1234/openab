@@ -284,7 +284,7 @@ fn section_discord_guide() {
         "   - SCOPES: bot",
         "   - BOT PERMISSIONS:",
         "     Send Messages | Embed Links | Attach Files",
-        "     Read Message History | Add Reactions",
+        "     Read Message History | Add Reactions | View Audit Log",
         "     Use Slash Commands",
         "",
         "6. Visit the generated URL -> add bot to your server",

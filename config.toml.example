@@ -19,6 +19,13 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # allow_dm = false                     # true = respond to Discord DMs; false (default) = ignore DMs
                                        # allowed_users still applies in DMs
 
+# Optional Workspace integration. Discord server owners bind root channels at
+# runtime with `/bind`; mappings persist in ~/.openab/channel_space.json.
+# [univer_workspace]
+# host = "https://workspace.example.com"
+# api_key = "${UNIVER_WORKSPACE_API_KEY}"
+# bot_cookie = "${UNIVER_WORKSPACE_BOT_COOKIE}"
+
 # [slack]
 # bot_token = "${SLACK_BOT_TOKEN}"     # Bot User OAuth Token (xoxb-...)
 # app_token = "${SLACK_APP_TOKEN}"     # App-Level Token (xapp-...) for Socket Mode
@@ -66,7 +73,7 @@ args = ["acp", "--trust-all-tools"]
 working_dir = "/home/agent"
 # per_session_working_dir = true       # false (default) = one shared cwd
 #                                      # true = create working_dir/<platform>_<thread-or-channel-id>
-# include_session_context = true       # add openabSession.channelKind to ACP session params
+# include_session_context = true       # add OpenAB routing metadata to ACP session params
 
 # [agent]
 # command = "claude-agent-acp"

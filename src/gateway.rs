@@ -889,6 +889,7 @@ pub async fn run_gateway_adapter(
                                         let buf_msg = crate::dispatch::BufferedMessage {
                                             sender_json,
                                             sender_name,
+                                            sender_id,
                                             prompt,
                                             extra_blocks,
                                             trigger_msg,

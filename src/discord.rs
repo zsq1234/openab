@@ -1,5 +1,5 @@
 use crate::acp::protocol::ConfigOption;
-use crate::acp::ContentBlock;
+use crate::acp::{ContentBlock, WorkspaceAccessOutcome, WorkspaceInitOutcome};
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TypingHandle,
 };
@@ -21,12 +21,12 @@ use serenity::http::Typing;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{ActionRowComponent, InputTextStyle};
 use serenity::model::application::{
-    Command, CommandOptionType, CommandType, ComponentInteractionDataKind, Interaction,
-    ResolvedTarget,
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction, ResolvedTarget,
 };
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, ReactionType};
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::guild::audit_log::{Action as AuditLogAction, ChannelAction};
+use serenity::model::id::{AuditLogEntryId, ChannelId, GuildId, MessageId, UserId};
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -49,6 +49,25 @@ const CONTEXT_HISTORY_PROMPT_BYTES: usize = 12_000;
 const READ_CONTEXT_COMMAND_NAME: &str = "Read Context";
 const HISTORY_BUTTON_PREFIX: &str = "ctxhist:";
 const HISTORY_MODAL_PREFIX: &str = "ctxmodal:";
+
+fn exposed_global_commands() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("bind")
+            .description("Bind this root channel to a Workspace Space")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "space_id",
+                    "Workspace Space ID",
+                )
+                .required(true),
+            ),
+        CreateCommand::new("init")
+            .description("Create and bind a Workspace Space for this root channel"),
+        CreateCommand::new("join").description("Join this channel's Workspace Space as an editor"),
+        CreateCommand::new("cancel").description("Cancel the current operation"),
+    ]
+}
 
 // --- DiscordAdapter: implements ChatAdapter for Discord via serenity ---
 
@@ -688,6 +707,47 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Workspace onboarding is independent of the @mention gate below. A user's
+        // first ordinary message in an allowed root channel logs them in and grants
+        // editor access to the mapped Space even when OpenAB will not answer that
+        // message. DiscordBotLoginClient caches successful user/Space grants; an
+        // unmapped channel returns before touching the cache or making HTTP requests.
+        if should_onboard_workspace_sender(msg.author.bot, in_thread, is_dm, msg.kind)
+            && !is_denied_user(
+                msg.author.bot,
+                self.allow_all_users,
+                &self.allowed_users,
+                msg.author.id.get(),
+            )
+        {
+            let discord_user_id = msg.author.id.to_string();
+            let discord_channel_id = msg.channel_id.to_string();
+            match self
+                .router
+                .pool()
+                .provision_workspace_editor(&discord_user_id, &discord_channel_id)
+                .await
+            {
+                Ok(WorkspaceAccessOutcome::Granted(space_id)) => {
+                    debug!(
+                        discord_user_id,
+                        discord_channel_id,
+                        space_id,
+                        "provisioned Workspace editor from Discord root-channel message"
+                    );
+                }
+                Ok(WorkspaceAccessOutcome::NotConfigured | WorkspaceAccessOutcome::Unmapped) => {}
+                Err(e) => {
+                    warn!(
+                        discord_user_id,
+                        discord_channel_id,
+                        error = %e,
+                        "failed to provision Workspace editor from Discord root-channel message"
+                    );
+                }
+            }
+        }
+
         // User message gating (mirrors Slack's AllowUsers logic).
         // Mentions: always require @mention, even in bot's own threads.
         // Involved (default): skip @mention if the bot owns the thread
@@ -1059,6 +1119,7 @@ impl EventHandler for Handler {
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
                 sender_name,
+                sender_id,
                 prompt,
                 extra_blocks,
                 trigger_msg,
@@ -1082,64 +1143,9 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
 
-        // Build the shared command list once.
-        let commands = vec![
-            CreateCommand::new("models").description("Select the AI model for this session"),
-            CreateCommand::new("agents").description("Select the agent mode for this session"),
-            CreateCommand::new("cancel").description("Cancel the current operation"),
-            CreateCommand::new("cancel-all")
-                .description("Cancel current operation and drop all buffered messages"),
-            CreateCommand::new("reset").description("Reset the conversation session"),
-            CreateCommand::new("remind")
-                .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "targets",
-                        "Users/roles to mention (e.g. @user1 @role1)",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "message",
-                        "Reminder message",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "delay",
-                        "Delay before firing (e.g. 30m, 2h, 1d)",
-                    )
-                    .required(true),
-                ),
-            CreateCommand::new("export-thread")
-                .description("Download this thread as a text file")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "limit",
-                    "Export only the most recent N messages (1–5000)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "since",
-                    "Export messages after this message ID",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "days",
-                    "Export messages from the last N days (1–365)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Boolean,
-                    "all",
-                    "Export all messages (up to 5000). Default is last 100.",
-                )),
-            CreateCommand::new(READ_CONTEXT_COMMAND_NAME).kind(CommandType::Message),
-        ];
+        // Keep the other interaction handlers implemented, but only expose the
+        // deliberately small public command surface below.
+        let commands = exposed_global_commands();
 
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
@@ -1198,6 +1204,15 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "join" => {
+                self.handle_join_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "bind" => {
+                self.handle_bind_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "init" => {
+                self.handle_init_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "remind" => {
                 self.handle_remind_command(&ctx, &cmd).await;
@@ -1476,6 +1491,219 @@ impl Handler {
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /reset command");
         }
+    }
+
+    async fn handle_join_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::warn!(error = %e, "failed to defer /join command");
+            return;
+        }
+
+        let discord_user_id = cmd.user.id.to_string();
+        let discord_channel_id = cmd.channel_id.to_string();
+        let message = match self
+            .router
+            .pool()
+            .provision_workspace_editor(&discord_user_id, &discord_channel_id)
+            .await
+        {
+            Ok(WorkspaceAccessOutcome::Granted(_)) => {
+                "✅ Workspace login successful. You now have editor access to this channel's Space."
+                    .to_string()
+            }
+            Ok(WorkspaceAccessOutcome::NotConfigured | WorkspaceAccessOutcome::Unmapped) => {
+                tracing::debug!(
+                    discord_user_id,
+                    discord_channel_id,
+                    "ignoring /join because the current Discord channel has no Workspace Space mapping"
+                );
+                "⚠️ This channel is not linked to a Workspace Space.".to_string()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    discord_user_id,
+                    discord_channel_id,
+                    error = %e,
+                    "failed to provision Workspace editor from /join"
+                );
+                "⚠️ Workspace login failed. Please try again later.".to_string()
+            }
+        };
+
+        if let Err(e) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(message))
+            .await
+        {
+            tracing::error!(error = %e, "failed to respond to /join command");
+        }
+    }
+
+    async fn handle_bind_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            warn!(error = %e, "failed to defer /bind command");
+            return;
+        }
+
+        let response = match self.bind_current_channel(ctx, cmd).await {
+            Ok(message) => message,
+            Err(e) => {
+                warn!(
+                    discord_user_id = %cmd.user.id,
+                    discord_channel_id = %cmd.channel_id,
+                    error = %e,
+                    "failed to bind Discord channel to Workspace Space"
+                );
+                format!("⚠️ {e}")
+            }
+        };
+
+        if let Err(e) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(response))
+            .await
+        {
+            error!(error = %e, "failed to respond to /bind command");
+        }
+    }
+
+    async fn bind_current_channel(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) -> anyhow::Result<String> {
+        self.validate_root_channel_command(ctx, cmd, "bind").await?;
+
+        let space_id = cmd
+            .data
+            .options
+            .iter()
+            .find(|option| option.name == "space_id")
+            .and_then(|option| option.value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Workspace Space ID is required."))?;
+
+        let configured = self
+            .router
+            .pool()
+            .bind_workspace_channel(&cmd.channel_id.to_string(), space_id)
+            .await?;
+        anyhow::ensure!(
+            configured,
+            "Univer Workspace integration is not configured."
+        );
+
+        Ok(format!(
+            "✅ Bound this channel to Workspace Space `{space_id}`."
+        ))
+    }
+
+    async fn handle_init_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            warn!(error = %e, "failed to defer /init command");
+            return;
+        }
+
+        let response = match self.init_current_channel(ctx, cmd).await {
+            Ok(message) => message,
+            Err(e) => {
+                warn!(
+                    discord_user_id = %cmd.user.id,
+                    discord_channel_id = %cmd.channel_id,
+                    error = %e,
+                    "failed to initialize Workspace Space for Discord channel"
+                );
+                format!("⚠️ {e}")
+            }
+        };
+        if let Err(e) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(response))
+            .await
+        {
+            error!(error = %e, "failed to respond to /init command");
+        }
+    }
+
+    async fn init_current_channel(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) -> anyhow::Result<String> {
+        let channel_name = self.validate_root_channel_command(ctx, cmd, "init").await?;
+        match self
+            .router
+            .pool()
+            .init_workspace_channel(&cmd.channel_id.to_string(), &channel_name)
+            .await?
+        {
+            WorkspaceInitOutcome::Created(space_id) => Ok(format!(
+                "✅ Created Workspace Space `{channel_name}` and bound it as `{space_id}`."
+            )),
+            WorkspaceInitOutcome::AlreadyBound => {
+                Ok("ℹ️ This channel is already bound; no changes were made.".to_string())
+            }
+            WorkspaceInitOutcome::NotConfigured => {
+                anyhow::bail!("Univer Workspace integration is not configured.")
+            }
+        }
+    }
+
+    async fn validate_root_channel_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+        command_name: &str,
+    ) -> anyhow::Result<String> {
+        let guild_id = cmd.guild_id.ok_or_else(|| {
+            anyhow::anyhow!("`/{command_name}` can only be used in a server root channel.")
+        })?;
+        let cached_owner_id = ctx.cache.guild(guild_id).map(|guild| guild.owner_id);
+        let owner_id = match cached_owner_id {
+            Some(owner_id) => owner_id,
+            None => guild_id.to_partial_guild(&ctx.http).await?.owner_id,
+        };
+        let channel = cmd.channel_id.to_channel(&ctx.http).await?;
+        let serenity::model::channel::Channel::Guild(guild_channel) = channel else {
+            validate_channel_command_authorization(
+                cmd.user.id.get(),
+                owner_id.get(),
+                None,
+                false,
+                command_name,
+            )?;
+            unreachable!("non-guild channel authorization always fails")
+        };
+        let is_root_guild_channel =
+            guild_channel.guild_id == guild_id && guild_channel.thread_metadata.is_none();
+
+        // Root Discord channels do not expose an owner/creator field. For /init,
+        // use Discord's CHANNEL_CREATE audit entry so the person who created the
+        // channel can initialize its Workspace Space. /bind remains owner-only.
+        let channel_creator_id =
+            if command_name == "init" && is_root_guild_channel && cmd.user.id != owner_id {
+                find_channel_creator(ctx, guild_id, cmd.channel_id).await?
+            } else {
+                None
+            };
+        validate_channel_command_authorization(
+            cmd.user.id.get(),
+            owner_id.get(),
+            channel_creator_id.map(UserId::get),
+            is_root_guild_channel,
+            command_name,
+        )?;
+        Ok(guild_channel.name)
     }
 
     async fn handle_remind_command(
@@ -2256,6 +2484,7 @@ impl Handler {
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
                 sender_name,
+                sender_id,
                 prompt,
                 extra_blocks,
                 trigger_msg,
@@ -2941,6 +3170,89 @@ fn detect_thread(
     (in_allowed_thread, Some(bot_owns))
 }
 
+fn should_onboard_workspace_sender(
+    author_is_bot: bool,
+    in_thread: bool,
+    is_dm: bool,
+    message_type: MessageType,
+) -> bool {
+    !author_is_bot
+        && !in_thread
+        && !is_dm
+        && matches!(
+            message_type,
+            MessageType::Regular | MessageType::InlineReply
+        )
+}
+
+async fn find_channel_creator(
+    ctx: &Context,
+    guild_id: GuildId,
+    channel_id: ChannelId,
+) -> anyhow::Result<Option<UserId>> {
+    let mut before: Option<AuditLogEntryId> = None;
+
+    loop {
+        let audit_logs = guild_id
+            .audit_logs(
+                &ctx.http,
+                Some(AuditLogAction::Channel(ChannelAction::Create)),
+                None,
+                before,
+                Some(100),
+            )
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Could not verify the channel creator from Discord's audit log. Grant the bot the `View Audit Log` permission and try again: {e}"
+                )
+            })?;
+
+        if let Some(entry) = audit_logs.entries.iter().find(|entry| {
+            entry
+                .target_id
+                .is_some_and(|id| id.get() == channel_id.get())
+        }) {
+            return Ok(Some(entry.user_id));
+        }
+
+        if audit_logs.entries.len() < 100 {
+            return Ok(None);
+        }
+        before = audit_logs.entries.last().map(|entry| entry.id);
+    }
+}
+
+fn validate_channel_command_authorization(
+    user_id: u64,
+    guild_owner_id: u64,
+    channel_creator_id: Option<u64>,
+    is_root_guild_channel: bool,
+    command_name: &str,
+) -> anyhow::Result<()> {
+    let is_authorized = user_id == guild_owner_id
+        || (command_name == "init" && channel_creator_id == Some(user_id));
+    anyhow::ensure!(
+        is_authorized,
+        "Only the server owner{} can use `/{command_name}`.{}",
+        if command_name == "init" {
+            " or channel creator"
+        } else {
+            ""
+        },
+        if command_name == "init" && channel_creator_id.is_none() {
+            " OpenAB could not verify the creator from Discord's audit log; the record may have expired."
+        } else {
+            ""
+        }
+    );
+    anyhow::ensure!(
+        is_root_guild_channel,
+        "`/{command_name}` can only be used in a server root channel, not a thread or DM."
+    );
+    Ok(())
+}
+
 /// Returns `true` if the author should be denied by the user allowlist.
 /// Bot authors skip this check — they are gated by `allow_bot_messages` + `trusted_bot_ids`.
 fn is_denied_user(
@@ -3043,6 +3355,90 @@ fn turn_limit_warning_present(messages: &[(bool, &str)]) -> bool {
 mod tests {
     use super::*;
     use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+
+    #[test]
+    fn only_workspace_commands_and_cancel_are_exposed() {
+        let names: Vec<String> = exposed_global_commands()
+            .into_iter()
+            .map(|command| {
+                serde_json::to_value(command).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(names, ["bind", "init", "join", "cancel"]);
+    }
+
+    #[test]
+    fn workspace_onboarding_only_accepts_human_root_channel_messages() {
+        assert!(should_onboard_workspace_sender(
+            false,
+            false,
+            false,
+            MessageType::Regular
+        ));
+        assert!(should_onboard_workspace_sender(
+            false,
+            false,
+            false,
+            MessageType::InlineReply
+        ));
+        assert!(!should_onboard_workspace_sender(
+            true,
+            false,
+            false,
+            MessageType::Regular
+        ));
+        assert!(!should_onboard_workspace_sender(
+            false,
+            true,
+            false,
+            MessageType::Regular
+        ));
+        assert!(!should_onboard_workspace_sender(
+            false,
+            false,
+            true,
+            MessageType::Regular
+        ));
+        assert!(!should_onboard_workspace_sender(
+            false,
+            false,
+            false,
+            MessageType::PinsAdd
+        ));
+    }
+
+    #[test]
+    fn channel_commands_require_authorized_user_and_root_channel() {
+        assert!(validate_channel_command_authorization(1, 1, None, true, "bind").is_ok());
+        assert_eq!(
+            validate_channel_command_authorization(2, 1, Some(3), true, "init")
+                .unwrap_err()
+                .to_string(),
+            "Only the server owner or channel creator can use `/init`."
+        );
+        assert_eq!(
+            validate_channel_command_authorization(1, 1, None, false, "init")
+                .unwrap_err()
+                .to_string(),
+            "`/init` can only be used in a server root channel, not a thread or DM."
+        );
+        assert!(validate_channel_command_authorization(2, 1, Some(2), true, "init").is_ok());
+        assert_eq!(
+            validate_channel_command_authorization(2, 1, None, true, "init")
+                .unwrap_err()
+                .to_string(),
+            "Only the server owner or channel creator can use `/init`. OpenAB could not verify the creator from Discord's audit log; the record may have expired."
+        );
+        assert_eq!(
+            validate_channel_command_authorization(2, 1, Some(2), true, "bind")
+                .unwrap_err()
+                .to_string(),
+            "Only the server owner can use `/bind`."
+        );
+    }
 
     // --- resolve_mentions tests ---
 

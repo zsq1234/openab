@@ -1,5 +1,6 @@
 mod acp;
 mod adapter;
+mod bot_login;
 mod bot_turns;
 mod config;
 mod context_mcp;
@@ -192,7 +193,17 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
-    let pool = Arc::new(acp::SessionPool::new(cfg.agent, cfg.pool.max_sessions));
+    let bot_login = cfg
+        .univer_workspace
+        .clone()
+        .map(bot_login::DiscordBotLoginClient::new)
+        .transpose()?
+        .map(Arc::new);
+    let pool = Arc::new(acp::SessionPool::new_with_bot_login(
+        cfg.agent,
+        cfg.pool.max_sessions,
+        bot_login.clone(),
+    ));
     let ttl = std::time::Duration::from_secs_f64(cfg.pool.session_ttl_hours * 3600.0);
 
     // Resolve STT config (auto-detect GROQ_API_KEY from env)

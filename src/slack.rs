@@ -1586,6 +1586,7 @@ async fn handle_message(
     let buf_msg = crate::dispatch::BufferedMessage {
         sender_json,
         sender_name: sender.sender_name.clone(),
+        sender_id: sender.sender_id.clone(),
         prompt,
         extra_blocks,
         trigger_msg,

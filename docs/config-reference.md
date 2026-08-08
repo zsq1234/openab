@@ -46,6 +46,58 @@ Discord adapter. Requires a Discord bot token.
 | `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies to `per-thread` / `per-lane` modes. |
 | `max_batch_tokens` | u32 | `24000` | Soft token cap per ACP turn. Only applies to `per-thread` / `per-lane` modes. |
 
+## `[univer_workspace]`
+
+Optional trusted Workspace Team Space integration. For bound Discord channels,
+OpenAB calls `POST {host}/api/auth/discord/bot-login`, reads the Workspace user
+ID from `user.id`, and uses the configured bot session to call
+`PUT /api/team-spaces/{spaceId}/members/{userId}` with role `editor`. Discord
+threads use their parent channel ID for mapping. The resolved
+`discord_user_id` → Workspace `user.id` mapping and completed membership grants
+are cached in memory; once a user ID is known, subsequent messages skip
+bot-login. User login cookies are not retained. Omitting this section preserves
+existing behavior. Channel mappings are managed by the Discord server owner
+with `/bind space_id:<id>` and persisted in `$HOME/.openab/channel_space.json`.
+When this integration is configured, Discord messages whose root channel has no
+stored mapping are silently discarded before ACP session creation or prompting.
+The Discord server owner or root channel creator may instead run `/init` in an
+unbound root channel to create a Team Space with the same name through
+`POST /api/team-spaces` and `publicRead: true`, then persist the returned Space
+ID. Creator authorization uses Discord's audit log and requires the bot's **View
+Audit Log** permission; if the channel's create record has expired after 45
+days, the server owner must run the command. `/init` is a no-op for an already
+bound channel.
+
+The persisted file is a JSON object keyed by Discord channel ID:
+
+```json
+{
+  "123456789012345678": "team-space-id"
+}
+```
+
+The first ordinary message a human sends in an allowed bound Discord root
+channel triggers onboarding before the @mention filter, so the message does not
+need to mention the bot. Successful user and Space membership lookups are cached
+in memory. Unmapped channels neither call Workspace nor create a cache entry.
+
+Discord also registers `/join` for explicit onboarding from a bound root
+channel. It logs in the invoking user and grants editor access to that channel's
+Team Space. Invoking it from an unmapped channel does not call Workspace.
+
+```toml
+[univer_workspace]
+host = "https://workspace.example.com"
+api_key = "${UNIVER_WORKSPACE_API_KEY}"
+bot_cookie = "${UNIVER_WORKSPACE_BOT_COOKIE}"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `host` | string | *required* | Workspace origin, such as `https://workspace.example.com`. Must start with `http://` or `https://`. |
+| `api_key` | string | *required* | Shared bot-login API key. Use `${UNIVER_WORKSPACE_API_KEY}`; it is sent only to Workspace and is never passed to the agent. |
+| `bot_cookie` | string | *required* | Cookie for a Workspace account allowed to manage Team Space members, for example `workspace_session=...`. Use `${UNIVER_WORKSPACE_BOT_COOKIE}`. It is never passed to the agent. |
+
 ---
 
 ## `[slack]`
@@ -132,7 +184,6 @@ The MCP server exposes:
   thread-backed task from the current inline normal-channel message and returns
   after the child task is enqueued. The agent passes
   `<sender_context>.handoff_token`, a thread title, and the child task prompt.
-
 When MCP injection is configured explicitly under `[agent]`, OpenAB passes the
 configured servers to ACP sessions as a name-keyed `mcpServers` object:
 
@@ -222,6 +273,19 @@ With `include_session_context = true`, OpenAB adds:
 ```
 
 `channelKind` is `"normal"` for inline normal-channel sessions and `"thread"` for Discord thread channels or Slack thread sessions.
+
+For a bound Discord channel, each user message receives `space_id` in its
+prompt-level `<sender_context>`. This is independent of `openabSession` and is
+available on every message:
+
+```text
+<sender_context>
+{"schema":"openab.sender.v1","sender_id":"123456789012345678","channel":"discord","channel_id":"123","space_id":"team-space-id"}
+</sender_context>
+```
+
+Neither `api_key`, the user's login cookie, nor `bot_cookie` is included in
+`sender_context`, ACP params, or the child process environment.
 
 ## S3 Discarded File Offload
 
@@ -662,6 +726,9 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
 | `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
 | `agents.<name>.discord.normalChannelReplyMode` | `[discord] normal_channel_reply_mode` |
+| `agents.<name>.univerWorkspace.host` | `[univer_workspace] host` |
+| `agents.<name>.univerWorkspace.apiKey` | `[univer_workspace] api_key` via Kubernetes Secret |
+| `agents.<name>.univerWorkspace.botCookie` | `[univer_workspace] bot_cookie` via Kubernetes Secret |
 | `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
 | `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
 | `agents.<name>.slack.normalChannelReplyMode` | `[slack] normal_channel_reply_mode` |

@@ -60,6 +60,18 @@ spec:
                   name: {{ include "openab.agentFullname" $d }}
                   key: discord-bot-token
             {{- end }}
+            {{- if and (dig "host" "" ($cfg.univerWorkspace | default dict)) (dig "apiKey" "" ($cfg.univerWorkspace | default dict)) (dig "botCookie" "" ($cfg.univerWorkspace | default dict)) }}
+            - name: UNIVER_WORKSPACE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: univer-workspace-api-key
+            - name: UNIVER_WORKSPACE_BOT_COOKIE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openab.agentFullname" $d }}
+                  key: univer-workspace-bot-cookie
+            {{- end }}
             {{- if and ($cfg.slack).enabled (or ($cfg.slack).botToken ($cfg.slack).existingSecret) }}
             - name: SLACK_BOT_TOKEN
               valueFrom:

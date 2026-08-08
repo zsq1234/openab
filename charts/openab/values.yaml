@@ -298,6 +298,12 @@ agents:
       # thread: create/join a thread for normal-channel @mentions.
       # inline: reply in the current channel, referencing the triggering message.
       normalChannelReplyMode: "thread"
+    # Optional Univer Workspace Team Space integration. apiKey and botCookie
+    # are stored in the generated Kubernetes Secret.
+    univerWorkspace:
+      host: ""
+      apiKey: ""
+      botCookie: ""
     slack:
       enabled: false
       botToken: ""       # Bot User OAuth Token (xoxb-...)

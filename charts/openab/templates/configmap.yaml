@@ -91,6 +91,19 @@ data:
     {{- end }}
     {{- end }}
 
+    {{- if (dig "host" "" ($cfg.univerWorkspace | default dict)) }}
+    {{- if not (dig "apiKey" "" ($cfg.univerWorkspace | default dict)) }}
+    {{- fail (printf "agents.%s.univerWorkspace.apiKey is required when host is set" $name) }}
+    {{- end }}
+    {{- if not (dig "botCookie" "" ($cfg.univerWorkspace | default dict)) }}
+    {{- fail (printf "agents.%s.univerWorkspace.botCookie is required when host is set" $name) }}
+    {{- end }}
+    [univer_workspace]
+    host = {{ (dig "host" "" ($cfg.univerWorkspace | default dict)) | toJson }}
+    api_key = "${UNIVER_WORKSPACE_API_KEY}"
+    bot_cookie = "${UNIVER_WORKSPACE_BOT_COOKIE}"
+    {{- end }}
+
     {{- if and ($cfg.slack).enabled }}
     [slack]
     bot_token = "${SLACK_BOT_TOKEN}"

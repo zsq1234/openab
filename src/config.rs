@@ -128,6 +128,7 @@ fn default_agentcore_cancel_strategy() -> AgentCoreCancelStrategy {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub discord: Option<DiscordConfig>,
+    pub univer_workspace: Option<UniverWorkspaceConfig>,
     pub slack: Option<SlackConfig>,
     pub gateway: Option<GatewayConfig>,
     pub agentcore: Option<AgentCoreConfig>,
@@ -527,6 +528,16 @@ pub struct DiscordConfig {
     pub max_batch_tokens: usize,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct UniverWorkspaceConfig {
+    /// Workspace origin, for example `https://workspace.example.com`.
+    pub host: String,
+    /// Shared secret sent as the `x-api-key` request header.
+    pub api_key: String,
+    /// Session cookie for a Workspace user allowed to manage Team Space members.
+    pub bot_cookie: String,
+}
+
 fn default_max_bot_turns() -> u32 {
     100
 }
@@ -838,7 +849,6 @@ fn inject_context_mcp_server(config: &mut Config) {
     {
         allowed_tools.push("handoff_to_thread".into());
     }
-
     config.agent.mcp_servers.push(AgentMcpServerConfig {
         name,
         transport: "http".into(),
@@ -1596,6 +1606,24 @@ include_session_context = true
 "#;
         let cfg = parse_config(toml, "test").unwrap();
         assert!(cfg.agent.include_session_context);
+    }
+
+    #[test]
+    fn parses_univer_workspace_config() {
+        let toml = r#"
+[discord]
+bot_token = "test-token"
+
+[univer_workspace]
+host = "https://workspace.example.com"
+api_key = "secret"
+bot_cookie = "workspace_session=bot-cookie"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        let workspace = cfg.univer_workspace.unwrap();
+        assert_eq!(workspace.host, "https://workspace.example.com");
+        assert_eq!(workspace.api_key, "secret");
+        assert_eq!(workspace.bot_cookie, "workspace_session=bot-cookie");
     }
 
     #[test]

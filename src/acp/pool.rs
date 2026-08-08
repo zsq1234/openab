@@ -1,5 +1,6 @@
 use crate::acp::connection::{AcpConnection, AcpWriter};
 use crate::acp::protocol::ConfigOption;
+use crate::bot_login::DiscordBotLoginClient;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -40,6 +41,7 @@ pub struct SessionPool {
     max_sessions: usize,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    bot_login: Option<Arc<DiscordBotLoginClient>>,
 }
 
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -51,12 +53,27 @@ pub enum AcpSessionChannelKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceAccessOutcome {
+    NotConfigured,
+    Granted(String),
+    Unmapped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceInitOutcome {
+    NotConfigured,
+    AlreadyBound,
+    Created(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpSessionContext {
     pub platform: String,
     pub channel_id: String,
     pub thread_id: Option<String>,
     pub parent_id: Option<String>,
     pub channel_kind: AcpSessionChannelKind,
+    pub discord_user_id: Option<String>,
 }
 
 impl AcpSessionContext {
@@ -65,13 +82,21 @@ impl AcpSessionContext {
             AcpSessionChannelKind::Normal => "normal",
             AcpSessionChannelKind::Thread => "thread",
         };
-        json!({
+        let mut value = json!({
             "platform": self.platform,
             "channelId": self.channel_id,
             "threadId": self.thread_id,
             "parentId": self.parent_id,
             "channelKind": channel_kind,
-        })
+        });
+        let object = value.as_object_mut().expect("session context is an object");
+        if let Some(discord_user_id) = &self.discord_user_id {
+            object.insert(
+                "discordUserId".into(),
+                Value::String(discord_user_id.clone()),
+            );
+        }
+        value
     }
 }
 
@@ -97,7 +122,24 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
 }
 
 impl SessionPool {
+    #[cfg(test)]
     pub fn new(config: AgentConfig, max_sessions: usize) -> Self {
+        Self::build(config, max_sessions, None)
+    }
+
+    pub fn new_with_bot_login(
+        config: AgentConfig,
+        max_sessions: usize,
+        bot_login: Option<Arc<DiscordBotLoginClient>>,
+    ) -> Self {
+        Self::build(config, max_sessions, bot_login)
+    }
+
+    fn build(
+        config: AgentConfig,
+        max_sessions: usize,
+        bot_login: Option<Arc<DiscordBotLoginClient>>,
+    ) -> Self {
         let openab_dir = std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
@@ -120,6 +162,7 @@ impl SessionPool {
             max_sessions,
             mapping_path,
             meta_path,
+            bot_login,
         }
     }
 
@@ -214,6 +257,65 @@ impl SessionPool {
         false
     }
 
+    pub async fn provision_workspace_editor(
+        &self,
+        discord_user_id: &str,
+        discord_root_channel_id: &str,
+    ) -> Result<WorkspaceAccessOutcome> {
+        let Some(client) = &self.bot_login else {
+            warn!(
+                discord_user_id,
+                discord_root_channel_id,
+                "Univer Workspace integration is not configured; sender context will not contain space_id"
+            );
+            return Ok(WorkspaceAccessOutcome::NotConfigured);
+        };
+        Ok(
+            match client
+                .provision_editor(discord_user_id, discord_root_channel_id)
+                .await?
+            {
+                Some(space_id) => WorkspaceAccessOutcome::Granted(space_id),
+                None => WorkspaceAccessOutcome::Unmapped,
+            },
+        )
+    }
+
+    /// Persist a Discord root-channel to Workspace Space binding.
+    /// Returns `false` when Workspace integration is not configured.
+    pub async fn bind_workspace_channel(
+        &self,
+        discord_channel_id: &str,
+        space_id: &str,
+    ) -> Result<bool> {
+        let Some(client) = &self.bot_login else {
+            return Ok(false);
+        };
+        client
+            .bind_channel_space(discord_channel_id, space_id)
+            .await?;
+        Ok(true)
+    }
+
+    pub async fn init_workspace_channel(
+        &self,
+        discord_channel_id: &str,
+        channel_name: &str,
+    ) -> Result<WorkspaceInitOutcome> {
+        let Some(client) = &self.bot_login else {
+            return Ok(WorkspaceInitOutcome::NotConfigured);
+        };
+        Ok(
+            match client
+                .init_channel_space(discord_channel_id, channel_name)
+                .await?
+            {
+                Some(space_id) => WorkspaceInitOutcome::Created(space_id),
+                None => WorkspaceInitOutcome::AlreadyBound,
+            },
+        )
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
@@ -225,6 +327,8 @@ impl SessionPool {
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
+
+        let enriched_session_context = session_context.cloned();
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
@@ -300,8 +404,8 @@ impl SessionPool {
             AcpConnection::spawn(&self.config, &effective_workdir, thread_id).await?;
 
         new_conn.initialize().await?;
-        if self.config.include_session_context {
-            if let Some(context) = session_context {
+        if let Some(context) = enriched_session_context {
+            if self.config.include_session_context {
                 new_conn.set_session_context(context.to_json());
             }
         }
@@ -665,7 +769,8 @@ fn sanitize_session_dir_component(thread_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_or_insert_gate, remove_if_same_handle, sanitize_session_dir_component, SessionPool,
+        get_or_insert_gate, remove_if_same_handle, sanitize_session_dir_component,
+        AcpSessionChannelKind, AcpSessionContext, SessionPool,
     };
     use crate::config::{AgentConfig, AgentTransport};
     use std::collections::HashMap;
@@ -706,6 +811,30 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn session_context_includes_discord_routing_metadata() {
+        let context = AcpSessionContext {
+            platform: "discord".into(),
+            channel_id: "channel-1".into(),
+            thread_id: Some("thread-1".into()),
+            parent_id: Some("channel-1".into()),
+            channel_kind: AcpSessionChannelKind::Thread,
+            discord_user_id: Some("123456789".into()),
+        };
+
+        assert_eq!(
+            context.to_json(),
+            serde_json::json!({
+                "platform": "discord",
+                "channelId": "channel-1",
+                "threadId": "thread-1",
+                "parentId": "channel-1",
+                "channelKind": "thread",
+                "discordUserId": "123456789",
+            })
+        );
     }
 
     #[test]

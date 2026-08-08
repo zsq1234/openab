@@ -35,7 +35,14 @@ Complete guide to setting up, configuring, and running OpenAB with Discord.
    - Read Message History
    - Add Reactions
    - Manage Messages
+   - View Audit Log (allows a root channel's creator to use `/init`)
 4. Copy the generated URL at the bottom
+
+Discord does not include a creator ID on root channel objects. OpenAB checks the
+server's `Channel Create` audit entry when a non-owner uses `/init`, so the bot
+needs **View Audit Log** for this authorization. Discord retains audit entries for
+45 days; for older channels whose create entry has expired, the server owner must
+run `/init`.
 
 ### 5. Invite the Bot to Your Server
 

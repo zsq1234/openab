@@ -65,7 +65,7 @@ Before running openab, enable these in the [Discord Developer Portal](https://di
    - ✅ Server Members Intent
 2. **OAuth2 → URL Generator → Bot Permissions**:
    - Send Messages, Embed Links, Attach Files
-   - Read Message History, Add Reactions
+   - Read Message History, Add Reactions, View Audit Log
 
 See [docs/discord.md](docs/discord.md) for a detailed step-by-step guide.
 

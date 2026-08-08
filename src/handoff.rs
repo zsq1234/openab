@@ -165,6 +165,7 @@ impl HandoffBroker {
         let msg = BufferedMessage {
             sender_json: entry.sender_json,
             sender_name: entry.sender_name,
+            sender_id: entry.sender_id,
             prompt: child_prompt,
             extra_blocks: entry.extra_blocks,
             trigger_msg: entry.trigger_msg,
@@ -321,6 +322,14 @@ mod tests {
 
         fn bot_home(&self) -> std::path::PathBuf {
             std::env::temp_dir()
+        }
+
+        async fn provision_workspace_sender(
+            &self,
+            _discord_user_id: &str,
+            _discord_root_channel_id: &str,
+        ) -> Result<crate::acp::WorkspaceAccessOutcome> {
+            Ok(crate::acp::WorkspaceAccessOutcome::NotConfigured)
         }
 
         async fn ensure_session(

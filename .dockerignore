@@ -1,0 +1,39 @@
+# Local build output is by far the largest directory and is rebuilt in the
+# Docker builder stage. Keep only the prebuilt binary required by Dockerfile.ws;
+# these rules also work with the legacy builder, which may not honor
+# Dockerfile-specific ignore files.
+**/target/**
+!/target/release/
+!/target/release/openab
+
+# Version-control and agent/editor metadata are not image inputs.
+.git/
+.github/
+.agents/
+.codex/
+.idea/
+.vscode/
+
+# Local configuration, credentials, logs, and temporary files.
+.env
+.env.*
+*.log
+*.tmp
+*.swp
+*~
+
+# Repository content not referenced by the root Dockerfiles.
+charts/
+docs/
+gateway/
+images/
+k8s/
+openshell/
+openspec/
+operator/
+tests/
+openab-auth-proxy/
+
+# OS metadata.
+.DS_Store
+Thumbs.db
